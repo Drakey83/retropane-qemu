@@ -116,6 +116,15 @@ static void tsc2046_mouse_event(void *opaque, int x, int y, int z,
     }
 }
 
+static void tsc2046_reset(DeviceState *dev)
+{
+    TSC2046State *s = TSC2046(dev);
+
+    /* Drive PENIRQ now that board wiring is in place. */
+    s->phase = 0;
+    tsc2046_update_penirq(s);
+}
+
 static void tsc2046_realize(SSIPeripheral *d, Error **errp)
 {
     DeviceState *dev = DEVICE(d);
@@ -156,6 +165,7 @@ static void tsc2046_class_init(ObjectClass *klass, void *data)
     k->set_cs = tsc2046_set_cs;
     k->cs_polarity = SSI_CS_LOW;
     dc->vmsd = &vmstate_tsc2046;
+    dc->reset = tsc2046_reset;
     set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
 }
 
