@@ -79,8 +79,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pxa27xUdcState, PXA27X_UDC)
 #define BULK_SIZE   64
 /* Virtual time between host steps (one IN/OUT token per step). */
 #define STEP_NS     (100 * 1000)
-/* Steps a control transfer may take before the host gives up. */
-#define XFER_LIMIT  2000
+/* Steps a control transfer may take before the host gives up: the USB
+ * spec's 5 s, so a slow emulation run doesn't look like a dead device. */
+#define XFER_LIMIT  50000
 
 enum host_state {
     H_IDLE,         /* controller off: detached */
@@ -512,8 +513,8 @@ static uint64_t udc_read(void *opaque, hwaddr addr, unsigned size)
     if (addr >= CSR(1) && addr < CSR(NEP)) {
         int x = (addr - CSR(0)) / 4;
         uint32_t v = s->csr[x];
-        if (x == in && (s->in_ready || s->in_len)) {
-            v |= CSR_BNX; /* IN: not empty (measured on the real X51v) */
+        if (x == in && !s->in_ready && s->in_len < BULK_SIZE) {
+            v |= CSR_BNX; /* IN: not full */
         }
         if (x == out && s->out_pos < s->out_len) {
             v |= CSR_BNX; /* not empty */
