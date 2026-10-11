@@ -68,6 +68,7 @@ jobs:
             mingw-w64-ucrt-x86_64-python-distlib
             mingw-w64-ucrt-x86_64-python-setuptools
             mingw-w64-ucrt-x86_64-python-pip
+            mingw-w64-ucrt-x86_64-meson
       - name: Configure and build
         run: |
           mkdir build && cd build
