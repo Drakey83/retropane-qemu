@@ -16,8 +16,10 @@
  *
  * The host is strict where the hardware is: a packet waits in its FIFO until
  * the host's next IN token (one host step), a full FIFO is sent without IPR,
- * and writing into a FIFO that still holds a packet is logged as a guest
- * error. Problems are logged with -d guest_errors.
+ * a host-to-device request ends with the guest's zero-length status IN (IPR,
+ * measured on the real X51v), and writing into a FIFO that still holds a
+ * packet is logged as a guest error. Problems are logged with
+ * -d guest_errors.
  */
 
 #include "qemu/osdep.h"
@@ -94,6 +96,8 @@ enum xfer_phase {
     X_IN,           /* collecting IN packets */
     X_STATUS_OUT,   /* zero-length OUT placed; waiting for OPC to clear */
     X_OUT,          /* OUT data placed; waiting for OPC to clear */
+    X_STATUS_IN,    /* host-to-device request: waiting for the guest's
+                     * zero-length status IN (IPR), as on the real X51v */
     X_WAIT_ACK,     /* SET_CONFIGURATION: waiting for AREN */
     X_WAIT_OPEN,    /* waiting for a client on the chardev */
 };
@@ -234,14 +238,8 @@ static bool host_xfer_step(Pxa27xUdcState *s)
             s->csr[0] |= CSR0_OPC;
             s->phase = X_OUT;
         } else {
-            /* No data stage: the hardware sends the status stage. */
-            if (s->csr[0] & CSR0_IPR) {
-                qemu_log_mask(LOG_GUEST_ERROR, "pxa27x-udc: IPR set for a "
-                              "host-to-device request (hardware does the "
-                              "status stage)\n");
-            }
-            s->phase = X_NONE;
-            return true;
+            /* No data stage: the guest sends the status IN. */
+            s->phase = X_STATUS_IN;
         }
         return false;
     case X_IN:
@@ -264,12 +262,27 @@ static bool host_xfer_step(Pxa27xUdcState *s)
         }
         return false;
     case X_STATUS_OUT:
+        if (!(s->csr[0] & CSR0_OPC)) {
+            s->phase = X_NONE;
+            return true;
+        }
+        return false;
     case X_OUT:
         if (!(s->csr[0] & CSR0_OPC)) {
-            if (s->phase == X_OUT && (s->csr[0] & CSR0_IPR)) {
-                qemu_log_mask(LOG_GUEST_ERROR, "pxa27x-udc: IPR set after "
-                              "OUT data (hardware does the status stage)\n");
+            s->phase = X_STATUS_IN; /* data taken: now the status IN */
+        }
+        return false;
+    case X_STATUS_IN:
+        if (s->ep0_ready) {
+            if (s->ep0_tx_len) {
+                qemu_log_mask(LOG_GUEST_ERROR, "pxa27x-udc: status IN carried "
+                              "%u bytes\n", s->ep0_tx_len);
             }
+            s->ep0_tx_len = 0;
+            s->ep0_ready = false;
+            s->csr[0] &= ~CSR0_IPR;
+            s->isr0 |= ISR0_EP0;
+            udc_update_irq(s);
             s->phase = X_NONE;
             return true;
         }
