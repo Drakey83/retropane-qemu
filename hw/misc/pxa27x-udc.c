@@ -509,8 +509,8 @@ static uint64_t udc_read(void *opaque, hwaddr addr, unsigned size)
     if (addr >= CSR(1) && addr < CSR(NEP)) {
         int x = (addr - CSR(0)) / 4;
         uint32_t v = s->csr[x];
-        if (x == in && !s->in_ready && s->in_len < BULK_SIZE) {
-            v |= CSR_BNX; /* not full */
+        if (x == in && (s->in_ready || s->in_len)) {
+            v |= CSR_BNX; /* IN: not empty (measured on the real X51v) */
         }
         if (x == out && s->out_pos < s->out_len) {
             v |= CSR_BNX; /* not empty */
