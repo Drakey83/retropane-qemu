@@ -164,7 +164,10 @@ static int find_slot(Pxa27xUdcState *s, bool in)
         bool enabled = c & 1;
         bool bulk = ((c >> 13) & 3) == 2;
         bool is_in = (c >> 12) & 1;
-        if (enabled && bulk && is_in == in) {
+        /* Only the active interface's endpoints work (measured on the
+         * real X51v); a CDC host never sends SET_INTERFACE, so that's 0. */
+        bool active = ((c >> 22) & 7) == ((s->udccr >> 8) & 7);
+        if (enabled && bulk && is_in == in && active) {
             return x;
         }
     }
