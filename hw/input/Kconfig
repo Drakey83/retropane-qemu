@@ -46,3 +46,7 @@ config TSC210X
 
 config LASIPS2
     select PS2
+
+config TSC2046
+    bool
+    depends on SSI

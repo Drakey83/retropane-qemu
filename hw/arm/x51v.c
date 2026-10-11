@@ -21,6 +21,7 @@
 #include "hw/misc/unimp.h"
 #include "hw/display/intel-2700g.h"
 #include "monitor/qdev.h"
+#include "hw/ssi/ssi.h"
 #include "hw/sysbus.h"
 #include "exec/address-spaces.h"
 
@@ -28,6 +29,10 @@
 #define X51V_CS0_BOOT       0x00000000  /* boot ROM / DiskOnChip G3 */
 #define X51V_CS3_2700G      0x0c000000  /* Intel 2700G: 16 MiB memory + regs */
 #define X51V_CS4_CPLD       0x10000000  /* board CPLD: power rails, LCD ID */
+
+/* GPIOs (retropane-os docs/hw/touch.md, from AxDroid). */
+#define X51V_GPIO_TS_CS     24  /* TSC2046 chip select (active low) */
+#define X51V_GPIO_TS_PENIRQ 94  /* TSC2046 pen interrupt (low = touched) */
 
 #define X51V_RAM_SIZE       (64 * MiB)
 #define X51V_BOOT_ROM_SIZE  (1 * MiB)
@@ -101,6 +106,13 @@ static void x51v_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(cpld), 0, X51V_CS4_CPLD);
 
     pxa27x_register_keypad(mpu->kp, x51v_keymap, 0xE0);
+
+    /* Touch screen: TSC2046 on SSP1, chip select and pen IRQ on GPIOs. */
+    DeviceState *ts = ssi_create_peripheral(mpu->ssp[0], "tsc2046");
+    qdev_connect_gpio_out(mpu->gpio, X51V_GPIO_TS_CS,
+                          qdev_get_gpio_in_named(ts, SSI_GPIO_CS, 0));
+    qdev_connect_gpio_out(ts, 0,
+                          qdev_get_gpio_in(mpu->gpio, X51V_GPIO_TS_PENIRQ));
 
     x51v_binfo.board_id = X51V_ARM_ID;
     arm_load_kernel(mpu->cpu, machine, &x51v_binfo);

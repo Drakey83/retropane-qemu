@@ -117,6 +117,8 @@ config X51V
     select UNIMP
     select INTEL_2700G
     select X51V_CPLD
+    select SSI
+    select TSC2046
 
 config MPS3R
     bool
