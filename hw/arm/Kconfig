@@ -116,6 +116,7 @@ config X51V
     select PXA2XX
     select UNIMP
     select INTEL_2700G
+    select X51V_CPLD
 
 config MPS3R
     bool

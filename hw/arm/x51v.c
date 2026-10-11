@@ -73,8 +73,11 @@ static void x51v_init(MachineState *machine)
                                 X51V_CS3_2700G + INTEL_2700G_VRAM_SIZE,
                                 INTEL_2700G_REG_OFFSET - INTEL_2700G_VRAM_SIZE);
 
-    /* Not modelled yet: log every access (RE aid). */
-    create_unimplemented_device("x51v.cpld", X51V_CS4_CPLD, X51V_CS_SIZE);
+    /* Board CPLD on CS4 (power rails, LCD type). */
+    DeviceState *cpld = qdev_new("x51v-cpld");
+    qdev_set_id(cpld, g_strdup("cpld"), &error_fatal);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(cpld), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(cpld), 0, X51V_CS4_CPLD);
 
     x51v_binfo.board_id = X51V_ARM_ID;
     arm_load_kernel(mpu->cpu, machine, &x51v_binfo);
