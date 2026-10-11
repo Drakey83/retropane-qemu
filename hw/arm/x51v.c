@@ -36,6 +36,27 @@
 /* Linux machine number; unused by RetroPane, which reads no ATAGs. */
 #define X51V_ARM_ID         0
 
+/*
+ * Button matrix, 7 rows x 3 columns (retropane-os docs/hw/keypad.md), indexed
+ * by PC scancode (extended keys as code | 0x80):
+ *   arrows/Enter = D-pad, F1 Calendar, F2 Contacts, F3 Mail, F4 Home,
+ *   F5 Record, F6 Wi-Fi.
+ */
+static const struct keymap x51v_keymap[0xE0] = {
+    [0 ... 0xDF] = { -1, -1 },
+    [0xC8] = { 2, 0 },  /* up    -> D-pad up    (row 0, col 2) */
+    [0xD0] = { 2, 1 },  /* down  -> D-pad down  (row 1, col 2) */
+    [0xCD] = { 2, 3 },  /* right -> D-pad right (row 3, col 2) */
+    [0xCB] = { 2, 4 },  /* left  -> D-pad left  (row 4, col 2) */
+    [0x1C] = { 2, 5 },  /* enter -> D-pad enter (row 5, col 2) */
+    [0x3B] = { 0, 3 },  /* F1    -> Calendar    (row 3, col 0) */
+    [0x3C] = { 0, 4 },  /* F2    -> Contacts    (row 4, col 0) */
+    [0x3D] = { 0, 5 },  /* F3    -> Mail        (row 5, col 0) */
+    [0x3E] = { 0, 6 },  /* F4    -> Home        (row 6, col 0) */
+    [0x3F] = { 0, 1 },  /* F5    -> Record      (row 1, col 0) */
+    [0x40] = { 0, 0 },  /* F6    -> Wi-Fi       (row 0, col 0) */
+};
+
 static struct arm_boot_info x51v_binfo = {
     .loader_start = PXA2XX_SDRAM_BASE,
     .ram_size = X51V_RAM_SIZE,
@@ -78,6 +99,8 @@ static void x51v_init(MachineState *machine)
     qdev_set_id(cpld, g_strdup("cpld"), &error_fatal);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(cpld), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(cpld), 0, X51V_CS4_CPLD);
+
+    pxa27x_register_keypad(mpu->kp, x51v_keymap, 0xE0);
 
     x51v_binfo.board_id = X51V_ARM_ID;
     arm_load_kernel(mpu->cpu, machine, &x51v_binfo);
