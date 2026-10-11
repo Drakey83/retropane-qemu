@@ -29,6 +29,8 @@
 #define X51V_CS0_BOOT       0x00000000  /* boot ROM / DiskOnChip G3 */
 #define X51V_CS3_2700G      0x0c000000  /* Intel 2700G: 16 MiB memory + regs */
 #define X51V_CS4_CPLD       0x10000000  /* board CPLD: power rails, LCD ID */
+#define PXA27X_UDC_BASE     0x40600000  /* USB device controller */
+#define PXA27X_PIC_USBC     11          /* its interrupt */
 
 /* GPIOs (retropane-os docs/hw/touch.md, from AxDroid). */
 #define X51V_GPIO_TS_CS     24  /* TSC2046 chip select (active low) */
@@ -115,6 +117,17 @@ static void x51v_init(MachineState *machine)
     qdev_set_id(cpld, g_strdup("cpld"), &error_fatal);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(cpld), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(cpld), 0, X51V_CS4_CPLD);
+
+    /*
+     * USB device controller with a built-in host (enumerates like Windows,
+     * then bridges the CDC serial data to `-global pxa27x-udc.chardev=ID`).
+     */
+    DeviceState *udc = qdev_new("pxa27x-udc");
+    qdev_set_id(udc, g_strdup("udc"), &error_fatal);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(udc), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(udc), 0, PXA27X_UDC_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(udc), 0,
+                       qdev_get_gpio_in(mpu->pic, PXA27X_PIC_USBC));
 
     pxa27x_register_keypad(mpu->kp, x51v_keymap, 0xE0);
 

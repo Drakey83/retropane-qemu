@@ -217,3 +217,6 @@ source macio/Kconfig
 
 config X51V_CPLD
     bool
+
+config PXA27X_UDC
+    bool
