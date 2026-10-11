@@ -65,6 +65,8 @@ jobs:
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-distlib
+            mingw-w64-ucrt-x86_64-python-setuptools
       - name: Configure and build
         run: |
           mkdir build && cd build
