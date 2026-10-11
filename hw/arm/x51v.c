@@ -34,6 +34,8 @@
 #define X51V_GPIO_TS_CS     24  /* TSC2046 chip select (active low) */
 #define X51V_GPIO_TS_PENIRQ 94  /* TSC2046 pen interrupt (low = touched) */
 
+/* SDRAM on SDCS2 (docs/hw in retropane-os). */
+#define X51V_SDRAM_BASE     0xa8000000
 #define X51V_RAM_SIZE       (64 * MiB)
 #define X51V_BOOT_ROM_SIZE  (1 * MiB)
 #define X51V_CS_SIZE        (64 * MiB)
@@ -63,7 +65,7 @@ static const struct keymap x51v_keymap[0xE0] = {
 };
 
 static struct arm_boot_info x51v_binfo = {
-    .loader_start = PXA2XX_SDRAM_BASE,
+    .loader_start = X51V_SDRAM_BASE,
     .ram_size = X51V_RAM_SIZE,
 };
 
@@ -74,6 +76,15 @@ static void x51v_init(MachineState *machine)
 
     /* PXA270 SoC with on-chip peripherals; FFUART is serial_hd(0). */
     mpu = pxa270_init(x51v_binfo.ram_size, machine->cpu_type);
+
+    /*
+     * The X51v's SDRAM is on SDCS2, not bank 0: Dell's OAL address table maps
+     * physical 0xA8000000 (64 MiB), and HaRET boots Linux with ramaddr
+     * 0xA8000000. Move the SoC's RAM there; nothing answers at 0xA0000000.
+     */
+    memory_region_del_subregion(get_system_memory(), &mpu->sdram);
+    memory_region_add_subregion(get_system_memory(), X51V_SDRAM_BASE,
+                                &mpu->sdram);
 
     /*
      * The real boot ROM (Dell bootloader + Windows Mobile) is never needed:
