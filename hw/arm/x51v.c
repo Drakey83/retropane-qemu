@@ -19,6 +19,9 @@
 #include "hw/arm/boot.h"
 #include "hw/boards.h"
 #include "hw/misc/unimp.h"
+#include "hw/display/intel-2700g.h"
+#include "monitor/qdev.h"
+#include "hw/sysbus.h"
 #include "exec/address-spaces.h"
 
 /* Static memory chip selects (PXA27x Developer's Manual, memory map). */
@@ -55,8 +58,22 @@ static void x51v_init(MachineState *machine)
                            &error_fatal);
     memory_region_add_subregion(get_system_memory(), X51V_CS0_BOOT, rom);
 
+    /*
+     * Intel 2700G on CS3: 16 MiB local memory at the window base, registers at
+     * +0x3FE0000. The rest of the window is unmodelled and logged.
+     */
+    DeviceState *gpu = qdev_new(TYPE_INTEL_2700G);
+    /* Named, so tools can pick its console: `screendump <file> mbx2700g`. */
+    qdev_set_id(gpu, g_strdup("mbx2700g"), &error_fatal);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(gpu), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(gpu), 0, X51V_CS3_2700G);
+    sysbus_mmio_map(SYS_BUS_DEVICE(gpu), 1,
+                    X51V_CS3_2700G + INTEL_2700G_REG_OFFSET);
+    create_unimplemented_device("x51v.2700g-unmapped",
+                                X51V_CS3_2700G + INTEL_2700G_VRAM_SIZE,
+                                INTEL_2700G_REG_OFFSET - INTEL_2700G_VRAM_SIZE);
+
     /* Not modelled yet: log every access (RE aid). */
-    create_unimplemented_device("x51v.2700g", X51V_CS3_2700G, X51V_CS_SIZE);
     create_unimplemented_device("x51v.cpld", X51V_CS4_CPLD, X51V_CS_SIZE);
 
     x51v_binfo.board_id = X51V_ARM_ID;

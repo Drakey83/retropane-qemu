@@ -115,6 +115,7 @@ config X51V
     depends on TCG && ARM
     select PXA2XX
     select UNIMP
+    select INTEL_2700G
 
 config MPS3R
     bool

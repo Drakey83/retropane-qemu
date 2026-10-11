@@ -143,3 +143,6 @@ config XLNX_DISPLAYPORT
 
 config DM163
     bool
+
+config INTEL_2700G
+    bool
