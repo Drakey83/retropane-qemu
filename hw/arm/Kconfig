@@ -109,6 +109,13 @@ config MAINSTONE
     select PFLASH_CFI01
     select SMC91C111
 
+config X51V
+    bool
+    default y
+    depends on TCG && ARM
+    select PXA2XX
+    select UNIMP
+
 config MPS3R
     bool
     default y
