@@ -56,7 +56,7 @@ jobs:
           msystem: UCRT64
           update: true
           install: >-
-            git make bison flex diffutils
+            git make bison flex diffutils zip
             mingw-w64-ucrt-x86_64-toolchain
             mingw-w64-ucrt-x86_64-glib2
             mingw-w64-ucrt-x86_64-pixman
