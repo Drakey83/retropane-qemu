@@ -39,6 +39,7 @@
 /* SD slot, as measured on the owner's X51v (RetroPane docs/hw/sd.md). */
 #define X51V_GPIO_SD_DETECT 12  /* card detect (low = card in) */
 #define X51V_GPIO_SD_WP     27  /* write protect (high = locked) */
+#define X51V_GPIO_POWER     0   /* power button (low at rest) */
 
 /* SDRAM on SDCS2 (docs/hw in retropane-os). */
 #define X51V_SDRAM_BASE     0xa8000000
@@ -149,6 +150,13 @@ static void x51v_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pwm), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(pwm), 0, 0x40B00000);
     sysbus_mmio_map(SYS_BUS_DEVICE(pwm), 1, 0x40C00000);
+
+    /* Power button on GPIO0: `qom-set /machine/peripheral/power pressed
+     * true` presses it. */
+    DeviceState *power = qdev_new("x51v-button");
+    qdev_set_id(power, g_strdup("power"), &error_fatal);
+    qdev_realize_and_unref(power, NULL, &error_fatal);
+    qdev_connect_gpio_out(power, 0, qdev_get_gpio_in(mpu->gpio, X51V_GPIO_POWER));
 
     /* SD slot switches: `-drive if=sd,readonly=on` reads as a locked card,
      * no card as detect high. */
