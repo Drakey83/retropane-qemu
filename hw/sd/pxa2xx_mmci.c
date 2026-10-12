@@ -66,6 +66,13 @@ struct PXA2xxMMCIState {
     uint32_t resp_len;
 
     int32_t cmdreq;
+
+    /* RetroPane: a block the card is too slow on for a multi-block read
+     * (in the card's address units: bytes for SDSC, blocks for SDHC).
+     * Reaching it in a CMD18 times the read out, as the owner's X51v card
+     * does at one block (0.79 s, longer than the controller waits); alone
+     * (CMD17) it reads. UINT32_MAX: none. */
+    uint32_t slow_addr;
 };
 
 static bool pxa2xx_mmci_vmstate_validate(void *opaque, int version_id)
@@ -137,6 +144,7 @@ static const VMStateDescription vmstate_pxa2xx_mmci = {
 /* Bitfield masks */
 #define STRPCL_STOP_CLK	(1 << 0)
 #define STRPCL_STRT_CLK	(1 << 1)
+#define STAT_READ_TOUT	(1 << 0)
 #define STAT_TOUT_RES	(1 << 1)
 #define STAT_CLK_EN	(1 << 8)
 #define STAT_DATA_DONE	(1 << 11)
@@ -195,6 +203,23 @@ static void pxa2xx_mmci_fifo_update(PXA2xxMMCIState *s)
             s->intreq |= INT_TXFIFO_REQ;
     } else
         while (s->bytesleft && s->rx_len < 32) {
+            if (s->cmd == 18 && s->slow_addr != UINT32_MAX && s->blklen > 0) {
+                uint32_t done = s->numblk * s->blklen - s->bytesleft;
+                if (done % s->blklen == 0 &&
+                    (s->arg + done == s->slow_addr ||
+                     s->arg + done / s->blklen == s->slow_addr)) {
+                    /* The block doesn't come in time: read timeout, and the
+                     * card gives up sending (so a CMD12 now is illegal). */
+                    SDRequest stop = { .cmd = 12, .arg = 0 };
+                    uint8_t r[16];
+                    sdbus_do_command(&s->sdbus, &stop, r);
+                    s->active = 0;
+                    s->bytesleft = 0;
+                    s->status |= STAT_READ_TOUT;
+                    pxa2xx_mmci_int_update(s);
+                    return;
+                }
+            }
             s->rx_fifo[(s->rx_start + (s->rx_len ++)) & 0x1f] =
                 sdbus_read_byte(&s->sdbus);
             s->bytesleft --;
@@ -579,12 +604,18 @@ static void pxa2xx_mmci_instance_init(Object *obj)
               TYPE_PXA2XX_MMCI_BUS, DEVICE(obj), "sd-bus");
 }
 
+static Property pxa2xx_mmci_properties[] = {
+    DEFINE_PROP_UINT32("slow-address", PXA2xxMMCIState, slow_addr, UINT32_MAX),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
 static void pxa2xx_mmci_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->vmsd = &vmstate_pxa2xx_mmci;
     dc->reset = pxa2xx_mmci_reset;
+    device_class_set_props(dc, pxa2xx_mmci_properties);
 }
 
 static void pxa2xx_mmci_bus_class_init(ObjectClass *klass, void *data)
