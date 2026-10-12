@@ -9,17 +9,31 @@
  * no "USB gadget" side, so the model contains the host too: once the guest
  * enables the controller it plays what Windows does when a device is plugged
  * in (bus resets, the descriptor reads, SET_CONFIGURATION, which the PXA27x
- * answers in hardware, then the CDC requests a terminal program sends on
- * open), and from then on bridges the guest's bulk endpoints to a chardev
- * (`-global pxa27x-udc.chardev=<id>`): bytes from the chardev become bulk OUT
- * packets, bulk IN packets go to the chardev.
+ * answers in hardware, Get Max LUN for a mass storage interface), then:
+ *
+ *  - the CDC serial function: when a client connects to the chardev
+ *    (`-global pxa27x-udc.chardev=<id>`), the requests a terminal program
+ *    sends on open, then bytes from the chardev become bulk OUT packets and
+ *    bulk IN packets go to the chardev (raw bytes);
+ *  - a USB Mass Storage function (RetroPane ADR-0014), if the configuration
+ *    has one: its bulk pair is bridged to a second chardev
+ *    (`-global pxa27x-udc.msc=<id>`), framed so transfers keep their
+ *    boundaries: the client sends each OUT transfer as a 4-byte
+ *    little-endian length and the bytes; each IN packet reaches the client
+ *    as a 1-byte length and the bytes (a zero length is a zero-length
+ *    packet).
+ *
+ * Like a real host, it reads the configuration descriptor to learn which
+ * endpoint belongs to which function (by interface class), and both
+ * functions run at the same time; the serial port's open requests don't hold
+ * up the drive.
  *
  * The host is strict where the hardware is: a packet waits in its FIFO until
  * the host's next IN token (one host step), a full FIFO is sent without IPR,
  * a host-to-device request ends with the guest's zero-length status IN (IPR,
- * measured on the real X51v), and writing into a FIFO that still holds a
- * packet is logged as a guest error. Problems are logged with
- * -d guest_errors.
+ * measured on the real X51v), only endpoints of the active interface work,
+ * and writing into a FIFO that still holds a packet is logged as a guest
+ * error. Problems are logged with -d guest_errors.
  */
 
 #include "qemu/osdep.h"
@@ -37,7 +51,7 @@
 #define TYPE_PXA27X_UDC "pxa27x-udc"
 OBJECT_DECLARE_SIMPLE_TYPE(Pxa27xUdcState, PXA27X_UDC)
 
-/* Registers (docs/hw/udc.md). */
+/* Registers (offsets from 0x40600000). */
 #define UDCCR       0x000
 #define UDCICR0     0x004
 #define UDCICR1     0x008
@@ -77,17 +91,27 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pxa27xUdcState, PXA27X_UDC)
 
 #define EP0_SIZE    16
 #define BULK_SIZE   64
-/* Virtual time between host steps (one IN/OUT token per step). */
+
 #define STEP_NS     (100 * 1000)
-/* Steps a control transfer may take before the host gives up: the USB
- * spec's 5 s, so a slow emulation run doesn't look like a dead device. */
+/* Give up on a control transfer after this many steps: 5 s, the USB 2.0
+ * limit for a whole control transfer (Windows is as patient). */
 #define XFER_LIMIT  50000
+
+/* Reset recovery: a host waits 10 ms after a bus reset before the next
+ * request (USB 2.0, TRSTRCY). Without it, a driver that handles the reset
+ * after the first SETUP arrived clears that SETUP's flags as it cleans up,
+ * and the request is lost (seen as intermittent first-request timeouts). */
+#define RESET_RECOVERY_STEPS 100
+
+/* Mass storage OUT transfers queued from the chardev. */
+#define MSC_XFERS   32
+#define MSC_RX      4096
 
 enum host_state {
     H_IDLE,         /* controller off: detached */
     H_ATTACH,       /* attached, about to reset */
     H_SCRIPT,       /* running the enumeration script */
-    H_RUN,          /* configured, bridging bulk data */
+    H_RUN,          /* configured: functions running */
     H_FAILED,
 };
 
@@ -100,14 +124,21 @@ enum xfer_phase {
     X_STATUS_IN,    /* host-to-device request: waiting for the guest's
                      * zero-length status IN (IPR), as on the real X51v */
     X_WAIT_ACK,     /* SET_CONFIGURATION: waiting for AREN */
-    X_WAIT_OPEN,    /* waiting for a client on the chardev */
 };
+
+/* One bulk endpoint slot's FIFO, as the host and the guest see it. */
+typedef struct BulkFifo {
+    uint8_t pkt[BULK_SIZE];
+    uint32_t len, pos;
+    bool ready;         /* IN: a packet waits for the host's IN token */
+} BulkFifo;
 
 struct Pxa27xUdcState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     qemu_irq irq;
     CharBackend chr;
+    CharBackend msc;
     QEMUTimer *timer;
 
     uint32_t udccr;
@@ -123,15 +154,26 @@ struct Pxa27xUdcState {
     uint32_t ep0_tx_len;
     bool ep0_ready;
 
-    /* Bulk: the OUT packet the guest is reading, the IN packet it is
-     * building, and whether a built IN packet waits for the host. */
-    uint8_t out_pkt[BULK_SIZE];
-    uint32_t out_len, out_pos;
-    uint8_t in_pkt[BULK_SIZE];
-    uint32_t in_len;
-    bool in_ready;
-    /* Bytes from the chardev not yet sent as OUT packets. */
+    /* Bulk FIFOs, one per endpoint slot. */
+    BulkFifo bulk[NEP];
+    /* Bytes from the serial chardev not yet sent as OUT packets. */
     Fifo8 host_rx;
+
+    /* Mass storage: OUT bytes from the chardev, the lengths of the
+     * transfers they belong to, and the frame header being parsed. */
+    Fifo8 msc_rx;
+    uint32_t msc_xfer[MSC_XFERS];
+    uint32_t msc_xfer_head, msc_xfer_count;
+    uint8_t msc_hdr[4];
+    uint32_t msc_hdr_len;
+    uint32_t msc_frame_left;
+    bool msc_open;
+
+    /* What the configuration descriptor says (endpoint numbers, 0 = none). */
+    uint8_t cdc_in_ep, cdc_out_ep;
+    uint8_t msc_in_ep, msc_out_ep;
+    int msc_iface;      /* -1: no mass storage interface */
+    uint8_t max_lun;
 
     /* The host. */
     enum host_state state;
@@ -145,12 +187,15 @@ struct Pxa27xUdcState {
     bool stalled;
     uint32_t xfer_steps;
     uint32_t attach_steps;
+    uint32_t wait_steps;    /* idle steps before the next script step */
     uint8_t config_value;
     uint32_t smac_count;
-    /* A program has the port open: a client on the chardev (or no chardev
-     * at all). Like Windows, the host sends the "open" requests (line
-     * coding, DTR) only then, so nothing the guest sends is lost. */
+    /* A program has the serial port open: a client on the chardev (or no
+     * chardev at all). Like Windows, the host sends the "open" requests
+     * (line coding, DTR) only then, so nothing the guest sends is lost. */
     bool chr_open;
+    /* The open requests: 0 not sent, 1/2 in progress, 3 done. */
+    uint32_t open_step;
 };
 
 static void udc_update_irq(Pxa27xUdcState *s)
@@ -158,17 +203,28 @@ static void udc_update_irq(Pxa27xUdcState *s)
     qemu_set_irq(s->irq, (s->isr0 & s->icr0) || (s->isr1 & s->icr1));
 }
 
-static int find_slot(Pxa27xUdcState *s, bool in)
+/* Whether slot x is an enabled bulk endpoint of the active interface. Only
+ * the active interface's endpoints work (measured on the real X51v); a CDC
+ * host never sends SET_INTERFACE, so that's 0. */
+static bool slot_active_bulk(Pxa27xUdcState *s, int x)
+{
+    uint32_t c = s->cr[x];
+    return (c & 1) && ((c >> 13) & 3) == 2 &&
+           ((c >> 22) & 7) == ((s->udccr >> 8) & 7);
+}
+
+static bool slot_is_in(Pxa27xUdcState *s, int x)
+{
+    return (s->cr[x] >> 12) & 1;
+}
+
+/* The active bulk slot for endpoint `number` in direction `in`; with
+ * number 0, the first active bulk slot in that direction. */
+static int find_slot(Pxa27xUdcState *s, uint8_t number, bool in)
 {
     for (int x = 1; x < NEP; x++) {
-        uint32_t c = s->cr[x];
-        bool enabled = c & 1;
-        bool bulk = ((c >> 13) & 3) == 2;
-        bool is_in = (c >> 12) & 1;
-        /* Only the active interface's endpoints work (measured on the
-         * real X51v); a CDC host never sends SET_INTERFACE, so that's 0. */
-        bool active = ((c >> 22) & 7) == ((s->udccr >> 8) & 7);
-        if (enabled && bulk && is_in == in && active) {
+        if (slot_active_bulk(s, x) && slot_is_in(s, x) == in &&
+            (number == 0 || ((s->cr[x] >> 15) & 0xF) == number)) {
             return x;
         }
     }
@@ -184,10 +240,9 @@ static void host_reset_bus(Pxa27xUdcState *s)
     s->ep0_ready = false;
     s->csr[0] = 0;
     s->udccr &= ~(3u << UDCCR_ACN_SHIFT);
-    s->out_len = s->out_pos = 0;
-    s->in_len = 0;
-    s->in_ready = false;
+    memset(s->bulk, 0, sizeof(s->bulk));
     s->phase = X_NONE;
+    s->open_step = 0;
     s->isr1 |= ISR1_RESET;
     udc_update_irq(s);
 }
@@ -293,18 +348,46 @@ static bool host_xfer_step(Pxa27xUdcState *s)
         return false;
     case X_WAIT_ACK:
         return false; /* ended by the AREN write */
-    case X_WAIT_OPEN:
-        s->xfer_steps = 0; /* no time limit: a person may open it any time */
-        if (s->chr_open) {
-            s->phase = X_NONE;
-            s->step--; /* run the open requests now */
-            return true;
-        }
-        return false;
     case X_NONE:
         return true;
     }
     return true;
+}
+
+/* Learns the functions' endpoints from the configuration descriptor, as a
+ * host's driver matching does: bulk endpoints of a CDC data interface
+ * (class 0x0A) carry the serial port, those of a mass storage interface
+ * (class 0x08, SCSI transparent, Bulk-Only) the drive. */
+static void host_parse_config(Pxa27xUdcState *s)
+{
+    uint8_t cls = 0, sub = 0, proto = 0;
+    int iface = -1;
+    s->cdc_in_ep = s->cdc_out_ep = 0;
+    s->msc_in_ep = s->msc_out_ep = 0;
+    s->msc_iface = -1;
+    for (uint32_t i = 0; i + 2 <= s->resp_len;) {
+        uint8_t len = s->resp[i], type = s->resp[i + 1];
+        if (len < 2 || i + len > s->resp_len) {
+            break;
+        }
+        if (type == 4 && len >= 9) {
+            iface = s->resp[i + 2];
+            cls = s->resp[i + 5];
+            sub = s->resp[i + 6];
+            proto = s->resp[i + 7];
+        } else if (type == 5 && len >= 7 && (s->resp[i + 3] & 3) == 2) {
+            uint8_t addr = s->resp[i + 2];
+            bool in = addr & 0x80;
+            uint8_t num = addr & 0xF;
+            if (cls == 0x0A) {
+                *(in ? &s->cdc_in_ep : &s->cdc_out_ep) = num;
+            } else if (cls == 0x08 && sub == 0x06 && proto == 0x50) {
+                *(in ? &s->msc_in_ep : &s->msc_out_ep) = num;
+                s->msc_iface = iface;
+            }
+        }
+        i += len;
+    }
 }
 
 /* The enumeration script: one control transfer per step number. */
@@ -312,9 +395,13 @@ static void host_script_start(Pxa27xUdcState *s)
 {
     s->out_data_len = 0;
     switch (s->step) {
-    case 0: host_reset_bus(s); s->phase = X_NONE; break;
+    case 0:
+    case 2:                                                   /* reset (2: then address) */
+        host_reset_bus(s);
+        s->phase = X_NONE;
+        s->wait_steps = RESET_RECOVERY_STEPS;
+        break;
     case 1: host_setup(s, 0x80, 6, 0x0100, 0, 64); break;     /* device, 64 */
-    case 2: host_reset_bus(s); s->phase = X_NONE; break;      /* reset, address */
     case 3: host_setup(s, 0x80, 6, 0x0100, 0, 18); break;     /* device */
     case 4: host_setup(s, 0x80, 6, 0x0200, 0, 9); break;      /* config head */
     case 5: host_setup(s, 0x80, 6, 0x0200, 0, 255); break;    /* config */
@@ -331,24 +418,22 @@ static void host_script_start(Pxa27xUdcState *s)
         s->xfer_steps = 0;
         s->phase = X_WAIT_ACK;
         break;
-    case 10: {
-        if (!s->chr_open) {
-            /* Wait for a program to open the port. */
-            s->phase = X_WAIT_OPEN;
-            return;
+    case 10:
+        /* Get Max LUN, as Windows' storage driver asks first. */
+        if (s->msc_iface >= 0) {
+            host_setup(s, 0xA1, 0xFE, 0, s->msc_iface, 1);
+        } else {
+            s->phase = X_NONE;
         }
-        /* SET_LINE_CODING 115200 8N1, as usbser.sys does on open. */
-        static const uint8_t coding[7] = { 0x00, 0xC2, 0x01, 0x00, 0, 0, 8 };
-        memcpy(s->out_data, coding, 7);
-        s->out_data_len = 7;
-        host_setup(s, 0x21, 0x20, 0, 0, 7);
         break;
-    }
-    case 11: host_setup(s, 0x21, 0x22, 3, 0, 0); break;        /* DTR+RTS */
     default:
         s->state = H_RUN;
         s->phase = X_NONE;
-        qemu_log_mask(LOG_UNIMP, "pxa27x-udc: enumerated and configured\n");
+        s->open_step = 0;
+        qemu_log_mask(LOG_UNIMP, "pxa27x-udc: enumerated and configured "
+                      "(serial %s, drive %s)\n",
+                      s->cdc_in_ep ? "yes" : "no",
+                      s->msc_iface >= 0 ? "yes" : "no");
         break;
     }
 }
@@ -368,36 +453,137 @@ static void host_script_check(Pxa27xUdcState *s)
             host_fail(s, "bad configuration descriptor");
         }
         break;
+    case 5:
+        host_parse_config(s);
+        break;
     case 8:
         if (!s->stalled) {
             host_fail(s, "a full-speed device must stall the qualifier");
         }
         break;
+    case 10:
+        if (s->msc_iface >= 0) {
+            if (s->stalled || s->resp_len != 1) {
+                /* Allowed by the spec for single-LUN devices. */
+                s->max_lun = 0;
+            } else {
+                s->max_lun = s->resp[0];
+            }
+        }
+        break;
     }
 }
 
-static void host_bridge_step(Pxa27xUdcState *s)
+/* The serial port's open requests, run while the functions are live. */
+static void host_open_step(Pxa27xUdcState *s)
 {
-    int in = find_slot(s, true), out = find_slot(s, false);
-
-    /* IN token: a waiting packet goes to the chardev. */
-    if (in > 0 && s->in_ready) {
-        qemu_chr_fe_write_all(&s->chr, s->in_pkt, s->in_len);
-        s->in_len = 0;
-        s->in_ready = false;
-        s->csr[in] |= CSR_PC;
-    }
-    /* OUT token: the next chunk of chardev bytes, when the guest has
-     * released the previous packet. */
-    if (out > 0 && !(s->csr[out] & CSR_PC) && !fifo8_is_empty(&s->host_rx)) {
-        uint32_t n = MIN(fifo8_num_used(&s->host_rx), BULK_SIZE);
-        for (uint32_t i = 0; i < n; i++) {
-            s->out_pkt[i] = fifo8_pop(&s->host_rx);
+    if (s->open_step == 0) {
+        if (!s->chr_open) {
+            return;
         }
-        s->out_len = n;
-        s->out_pos = 0;
-        s->csr[out] |= CSR_PC;
+        /* SET_LINE_CODING 115200 8N1, as usbser.sys does on open. */
+        static const uint8_t coding[7] = { 0x00, 0xC2, 0x01, 0x00, 0, 0, 8 };
+        memcpy(s->out_data, coding, 7);
+        s->out_data_len = 7;
+        host_setup(s, 0x21, 0x20, 0, 0, 7);
+        s->open_step = 1;
+        return;
+    }
+    if (s->open_step >= 3 || !host_xfer_step(s)) {
+        return;
+    }
+    if (s->open_step == 1) {
+        s->out_data_len = 0;
+        host_setup(s, 0x21, 0x22, 3, 0, 0);        /* DTR+RTS */
+        s->open_step = 2;
+    } else {
+        s->open_step = 3;
+    }
+}
+
+/* IN token on slot x: a waiting packet is taken; returns its length or -1. */
+static int host_take_in(Pxa27xUdcState *s, int x, uint8_t *out)
+{
+    BulkFifo *f = &s->bulk[x];
+    if (x <= 0 || !f->ready) {
+        return -1;
+    }
+    int n = f->len;
+    memcpy(out, f->pkt, n);
+    f->len = 0;
+    f->ready = false;
+    s->csr[x] |= CSR_PC;
+    return n;
+}
+
+/* OUT token on slot x, when the guest has released the previous packet. */
+static bool host_can_out(Pxa27xUdcState *s, int x)
+{
+    return x > 0 && !(s->csr[x] & CSR_PC);
+}
+
+static void host_put_out(Pxa27xUdcState *s, int x, const uint8_t *b,
+                         uint32_t n)
+{
+    BulkFifo *f = &s->bulk[x];
+    memcpy(f->pkt, b, n);
+    f->len = n;
+    f->pos = 0;
+    s->csr[x] |= CSR_PC;
+}
+
+static void host_bridge_serial(Pxa27xUdcState *s)
+{
+    if (s->open_step < 3) {
+        return; /* Windows polls the data pipe only once the port is open */
+    }
+    int in = find_slot(s, s->cdc_in_ep, true);
+    int out = find_slot(s, s->cdc_out_ep, false);
+    uint8_t p[BULK_SIZE];
+    int n = host_take_in(s, in, p);
+    if (n >= 0) {
+        qemu_chr_fe_write_all(&s->chr, p, n);
+    }
+    if (host_can_out(s, out) && !fifo8_is_empty(&s->host_rx)) {
+        uint32_t m = MIN(fifo8_num_used(&s->host_rx), BULK_SIZE);
+        for (uint32_t i = 0; i < m; i++) {
+            p[i] = fifo8_pop(&s->host_rx);
+        }
+        host_put_out(s, out, p, m);
         qemu_chr_fe_accept_input(&s->chr);
+    }
+}
+
+static void host_bridge_msc(Pxa27xUdcState *s)
+{
+    if (s->msc_iface < 0 || !s->msc_open) {
+        return;
+    }
+    int in = find_slot(s, s->msc_in_ep, true);
+    int out = find_slot(s, s->msc_out_ep, false);
+    uint8_t p[BULK_SIZE + 1];
+    int n = host_take_in(s, in, p + 1);
+    if (n >= 0) {
+        p[0] = n;
+        qemu_chr_fe_write_all(&s->msc, p, n + 1);
+    }
+    /* OUT: the next packet of the oldest transfer, once all of it (up to a
+     * packet) has arrived, so packets never split early. */
+    if (host_can_out(s, out) && s->msc_xfer_count) {
+        uint32_t *left = &s->msc_xfer[s->msc_xfer_head];
+        uint32_t need = MIN(*left, BULK_SIZE);
+        if (fifo8_num_used(&s->msc_rx) >= need) {
+            for (uint32_t i = 0; i < need; i++) {
+                p[i] = fifo8_pop(&s->msc_rx);
+            }
+            host_put_out(s, out, p, need);
+            *left -= need;
+            if (*left == 0) {
+                s->msc_xfer_head = (s->msc_xfer_head + 1) % MSC_XFERS;
+                s->msc_xfer_count--;
+            }
+            qemu_chr_fe_accept_input(&s->msc);
+        }
     }
 }
 
@@ -417,6 +603,10 @@ static void host_step(void *opaque)
         }
         break;
     case H_SCRIPT:
+        if (s->wait_steps) {
+            s->wait_steps--;
+            break;
+        }
         if (host_xfer_step(s)) {
             host_script_check(s);
             if (s->state == H_SCRIPT) {
@@ -426,7 +616,9 @@ static void host_step(void *opaque)
         }
         break;
     case H_RUN:
-        host_bridge_step(s);
+        host_open_step(s);
+        host_bridge_serial(s);
+        host_bridge_msc(s);
         break;
     }
     if (s->state != H_IDLE) {
@@ -434,7 +626,7 @@ static void host_step(void *opaque)
     }
 }
 
-/* ---- chardev ---------------------------------------------------------- */
+/* ---- chardevs --------------------------------------------------------- */
 
 static int udc_can_receive(void *opaque)
 {
@@ -460,6 +652,56 @@ static void udc_receive(void *opaque, const uint8_t *buf, int size)
                                          fifo8_num_free(&s->host_rx)));
 }
 
+static int msc_can_receive(void *opaque)
+{
+    Pxa27xUdcState *s = opaque;
+    if (s->state != H_RUN || s->msc_xfer_count >= MSC_XFERS - 1) {
+        return 0;
+    }
+    /* Header bytes take no FIFO space, so this never overfills it. */
+    return fifo8_num_free(&s->msc_rx);
+}
+
+static void msc_event(void *opaque, QEMUChrEvent event)
+{
+    Pxa27xUdcState *s = opaque;
+
+    if (event == CHR_EVENT_OPENED || event == CHR_EVENT_CLOSED) {
+        s->msc_open = event == CHR_EVENT_OPENED;
+        fifo8_reset(&s->msc_rx);
+        s->msc_xfer_head = s->msc_xfer_count = 0;
+        s->msc_hdr_len = 0;
+        s->msc_frame_left = 0;
+    }
+}
+
+static void msc_receive(void *opaque, const uint8_t *buf, int size)
+{
+    Pxa27xUdcState *s = opaque;
+    for (int i = 0; i < size; i++) {
+        if (s->msc_frame_left == 0) {
+            s->msc_hdr[s->msc_hdr_len++] = buf[i];
+            if (s->msc_hdr_len == 4) {
+                uint32_t len = ldl_le_p(s->msc_hdr);
+                s->msc_hdr_len = 0;
+                if (len == 0 || s->msc_xfer_count >= MSC_XFERS) {
+                    continue; /* nothing to send */
+                }
+                s->msc_frame_left = len;
+                uint32_t tail = (s->msc_xfer_head + s->msc_xfer_count)
+                                % MSC_XFERS;
+                s->msc_xfer[tail] = len;
+                s->msc_xfer_count++;
+            }
+            continue;
+        }
+        if (!fifo8_is_full(&s->msc_rx)) {
+            fifo8_push(&s->msc_rx, buf[i]);
+        }
+        s->msc_frame_left--;
+    }
+}
+
 /* ---- guest side ------------------------------------------------------- */
 
 static void ep0_push(Pxa27xUdcState *s, const uint8_t *b, unsigned n)
@@ -477,25 +719,36 @@ static void ep0_push(Pxa27xUdcState *s, const uint8_t *b, unsigned n)
     }
 }
 
-static void in_push(Pxa27xUdcState *s, const uint8_t *b, unsigned n)
+static void in_push(Pxa27xUdcState *s, int x, const uint8_t *b, unsigned n)
 {
-    if (s->in_ready) {
-        qemu_log_mask(LOG_GUEST_ERROR, "pxa27x-udc: wrote the bulk IN FIFO "
-                      "while a packet waits for the host\n");
+    BulkFifo *f = &s->bulk[x];
+    if (f->ready) {
+        qemu_log_mask(LOG_GUEST_ERROR, "pxa27x-udc: wrote bulk IN slot %d "
+                      "while a packet waits for the host\n", x);
         return;
     }
-    for (unsigned i = 0; i < n && s->in_len < BULK_SIZE; i++) {
-        s->in_pkt[s->in_len++] = b[i];
+    for (unsigned i = 0; i < n && f->len < BULK_SIZE; i++) {
+        f->pkt[f->len++] = b[i];
     }
-    if (s->in_len >= BULK_SIZE) {
-        s->in_ready = true;
+    if (f->len >= BULK_SIZE) {
+        f->ready = true;
     }
+}
+
+/* The active bulk slot a CSR/BCR/DR address belongs to, or -1. */
+static int bulk_slot(Pxa27xUdcState *s, hwaddr addr, hwaddr base)
+{
+    if (addr < base + 4 || addr >= base + 4 * NEP) {
+        return -1;
+    }
+    int x = (addr - base) / 4;
+    return slot_active_bulk(s, x) ? x : -1;
 }
 
 static uint64_t udc_read(void *opaque, hwaddr addr, unsigned size)
 {
     Pxa27xUdcState *s = opaque;
-    int in = find_slot(s, true), out = find_slot(s, false);
+    int x;
 
     switch (addr) {
     case UDCCR:   return s->udccr;
@@ -511,21 +764,22 @@ static uint64_t udc_read(void *opaque, hwaddr addr, unsigned size)
         return s->csr[0] | (fifo8_is_empty(&s->ep0_rx) ? 0 : CSR0_RNE);
     }
     if (addr >= CSR(1) && addr < CSR(NEP)) {
-        int x = (addr - CSR(0)) / 4;
-        uint32_t v = s->csr[x];
-        if (x == in && !s->in_ready && s->in_len < BULK_SIZE) {
-            v |= CSR_BNX; /* IN: not full */
-        }
-        if (x == out && s->out_pos < s->out_len) {
-            v |= CSR_BNX; /* not empty */
+        int y = (addr - CSR(0)) / 4;
+        uint32_t v = s->csr[y];
+        if (slot_active_bulk(s, y)) {
+            BulkFifo *f = &s->bulk[y];
+            if (slot_is_in(s, y) ? (!f->ready && f->len < BULK_SIZE)
+                                 : (f->pos < f->len)) {
+                v |= CSR_BNX; /* IN: not full; OUT: not empty */
+            }
         }
         return v;
     }
     if (addr == BCR(0)) {
         return fifo8_num_used(&s->ep0_rx);
     }
-    if (out > 0 && addr == BCR(out)) {
-        return s->out_len - s->out_pos;
+    if ((x = bulk_slot(s, addr, BCR(0))) > 0 && !slot_is_in(s, x)) {
+        return s->bulk[x].len - s->bulk[x].pos;
     }
     if (addr == DR(0)) {
         uint32_t v = 0;
@@ -535,10 +789,11 @@ static uint64_t udc_read(void *opaque, hwaddr addr, unsigned size)
         }
         return v;
     }
-    if (out > 0 && addr == DR(out)) {
+    if ((x = bulk_slot(s, addr, DR(0))) > 0 && !slot_is_in(s, x)) {
+        BulkFifo *f = &s->bulk[x];
         uint32_t v = 0;
         for (unsigned i = 0; i < size; i++) {
-            uint8_t b = s->out_pos < s->out_len ? s->out_pkt[s->out_pos++] : 0;
+            uint8_t b = f->pos < f->len ? f->pkt[f->pos++] : 0;
             v |= (uint32_t)b << (8 * i);
         }
         return v;
@@ -552,7 +807,7 @@ static uint64_t udc_read(void *opaque, hwaddr addr, unsigned size)
 static void udc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     Pxa27xUdcState *s = opaque;
-    int in = find_slot(s, true), out = find_slot(s, false);
+    int x;
 
     switch (addr) {
     case UDCCR: {
@@ -597,24 +852,20 @@ static void udc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         return;
     }
     if (addr >= CSR(1) && addr < CSR(NEP)) {
-        int x = (addr - CSR(0)) / 4;
+        int y = (addr - CSR(0)) / 4;
+        bool bulk = slot_active_bulk(s, y);
+        bool in = slot_is_in(s, y);
         if (val & CSR_PC) {
-            s->csr[x] &= ~CSR_PC;
-            if (x == out) {
-                s->out_len = s->out_pos = 0; /* packet released */
+            s->csr[y] &= ~CSR_PC;
+            if (bulk && !in) {
+                s->bulk[y].len = s->bulk[y].pos = 0; /* packet released */
             }
         }
-        if (x == in && (val & CSR_SP)) {
-            s->in_ready = true;
+        if (bulk && in && (val & CSR_SP)) {
+            s->bulk[y].ready = true;
         }
-        if (val & CSR_FEF) {
-            if (x == in) {
-                s->in_len = 0;
-                s->in_ready = false;
-            }
-            if (x == out) {
-                s->out_len = s->out_pos = 0;
-            }
+        if (bulk && (val & CSR_FEF)) {
+            memset(&s->bulk[y], 0, sizeof(s->bulk[y]));
         }
         return;
     }
@@ -626,12 +877,12 @@ static void udc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         ep0_push(s, b, size);
         return;
     }
-    if (in > 0 && addr == DR(in)) {
+    if ((x = bulk_slot(s, addr, DR(0))) > 0 && slot_is_in(s, x)) {
         uint8_t b[4];
         for (unsigned i = 0; i < size; i++) {
             b[i] = val >> (8 * i);
         }
-        in_push(s, b, size);
+        in_push(s, x, b, size);
         return;
     }
     if (addr >= CR(1) && addr < CR(NEP)) {
@@ -665,12 +916,18 @@ static void udc_reset(DeviceState *dev)
     memset(s->cr, 0, sizeof(s->cr));
     fifo8_reset(&s->ep0_rx);
     fifo8_reset(&s->host_rx);
+    fifo8_reset(&s->msc_rx);
+    s->msc_xfer_head = s->msc_xfer_count = 0;
+    s->msc_hdr_len = 0;
+    s->msc_frame_left = 0;
     s->ep0_tx_len = 0;
     s->ep0_ready = false;
-    s->out_len = s->out_pos = s->in_len = 0;
-    s->in_ready = false;
+    memset(s->bulk, 0, sizeof(s->bulk));
+    s->msc_iface = -1;
+    s->cdc_in_ep = s->cdc_out_ep = s->msc_in_ep = s->msc_out_ep = 0;
     s->state = H_IDLE;
     s->phase = X_NONE;
+    s->open_step = 0;
     timer_del(s->timer);
     qemu_set_irq(s->irq, 0);
 }
@@ -685,15 +942,21 @@ static void udc_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
     fifo8_create(&s->ep0_rx, 64);
     fifo8_create(&s->host_rx, 256);
+    fifo8_create(&s->msc_rx, MSC_RX);
+    s->msc_iface = -1;
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, host_step, s);
     qemu_chr_fe_set_handlers(&s->chr, udc_can_receive, udc_receive, udc_event,
                              NULL, s, NULL, true);
+    qemu_chr_fe_set_handlers(&s->msc, msc_can_receive, msc_receive, msc_event,
+                             NULL, s, NULL, true);
     /* Without a chardev there is nothing to wait for. */
     s->chr_open = !qemu_chr_fe_backend_connected(&s->chr);
+    s->msc_open = false;
 }
 
 static Property udc_properties[] = {
     DEFINE_PROP_CHR("chardev", Pxa27xUdcState, chr),
+    DEFINE_PROP_CHR("msc", Pxa27xUdcState, msc),
     DEFINE_PROP_END_OF_LIST(),
 };
 
