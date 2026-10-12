@@ -45,6 +45,7 @@
 #define X51V_GPIO_SD_WP     27  /* write protect (high = locked) */
 #define X51V_GPIO_POWER     0   /* power button (low at rest) */
 #define X51V_GPIO_CF_DETECT 13  /* CF card detect (low = card in) */
+#define X51V_GPIO_HP_DETECT 83  /* headphone jack (assumed high = plugged) */
 #define X51V_WM8750_ADDR    0x1a /* codec on the I2C bus (CSB unknown: 0x1a or 0x1b) */
 
 /* SDRAM on SDCS2 (docs/hw in retropane-os). */
@@ -187,10 +188,18 @@ static void x51v_init(MachineState *machine)
         }
     }
 
+    /* Headphone jack on GPIO83, a switch like the power button:
+     * `qom-set /machine/peripheral/jack pressed true` plugs headphones in
+     * (high: assumed, unconfirmed on the device). */
+    DeviceState *jack = qdev_new("x51v-button");
+    qdev_set_id(jack, g_strdup("jack"), &error_fatal);
+    qdev_realize_and_unref(jack, NULL, &error_fatal);
+    qdev_connect_gpio_out(jack, 0, qdev_get_gpio_in(mpu->gpio, X51V_GPIO_HP_DETECT));
+
     /* Audio: a WM8750 codec on the PXA I2C bus, fed by the I2S controller
      * (docs/research/hardware-inventory.md). `-machine audiodev=ID` picks
      * the output (tests record a wav). The amplifier (GPIO82, CPLD 0x14)
-     * and headphone detect (GPIO83) are not modelled. */
+     * is not modelled. */
     {
         I2CSlave *codec = i2c_slave_new(TYPE_WM8750, X51V_WM8750_ADDR);
 
