@@ -45,6 +45,8 @@
 #define X51V_GPIO_SD_WP     27  /* write protect (high = locked) */
 #define X51V_GPIO_POWER     0   /* power button (low at rest) */
 #define X51V_GPIO_CF_DETECT 13  /* CF card detect (low = card in) */
+#define X51V_GPIO_CF_RESET  36  /* CF RESET (output, high = held in reset) */
+#define X51V_GPIO_CF_READY  84  /* CF READY (high = ready) */
 #define X51V_GPIO_HP_DETECT 83  /* headphone jack (assumed high = plugged) */
 #define X51V_WM8750_ADDR    0x1a /* codec on the I2C bus (CSB unknown: 0x1a or 0x1b) */
 
@@ -82,6 +84,34 @@ static struct arm_boot_info x51v_binfo = {
     .loader_start = X51V_SDRAM_BASE,
     .ram_size = X51V_RAM_SIZE,
 };
+
+/*
+ * The CF socket's RESET and READY lines (AxDroid's board code; retropane-os
+ * docs/hw/cf.md). READY is modelled as "a card is in and not held in
+ * reset": QEMU's card answers at once, so its busy times after a reset or
+ * a command are not modelled. Releasing RESET resets the card to its
+ * power-on state (memory mode, idle), as a hardware reset does.
+ */
+typedef struct {
+    PCMCIACardState *card;
+    qemu_irq ready;
+    bool held;
+} X51vCfLines;
+
+static void x51v_cf_reset(void *opaque, int n, int level)
+{
+    X51vCfLines *l = opaque;
+
+    if (level && !l->held) {
+        l->held = true;
+    } else if (!level && l->held) {
+        l->held = false;
+        if (l->card) {
+            device_cold_reset(DEVICE(l->card));
+        }
+    }
+    qemu_set_irq(l->ready, l->card && !l->held);
+}
 
 static void x51v_init(MachineState *machine)
 {
@@ -175,17 +205,24 @@ static void x51v_init(MachineState *machine)
     /* CompactFlash slot, PC Card socket 1: `-drive if=ide,file=cf.img`
      * puts a CF card in it (QEMU's microdrive model: CIS, memory and I/O
      * modes, ATA). Detect on GPIO13, low with a card; an empty slot reads
-     * high. The card's ready/IRQ line (GPIO84) is not modelled. */
+     * high. RESET on GPIO36, READY on GPIO84 (x51v_cf_reset). The card's
+     * interrupt is not modelled (memory mode, polled). */
     {
         qemu_irq cd = qemu_irq_invert(qdev_get_gpio_in(mpu->gpio,
                                                        X51V_GPIO_CF_DETECT));
         DriveInfo *cf = drive_get(IF_IDE, 0, 0);
+        X51vCfLines *lines = g_new0(X51vCfLines, 1);
 
         pxa2xx_pcmcia_set_irq_cb(mpu->pcmcia[1], NULL, cd);
         qemu_irq_lower(cd);
         if (cf) {
-            pxa2xx_pcmcia_attach(mpu->pcmcia[1], dscm1xxxx_init(cf));
+            lines->card = dscm1xxxx_init(cf);
+            pxa2xx_pcmcia_attach(mpu->pcmcia[1], lines->card);
         }
+        lines->ready = qdev_get_gpio_in(mpu->gpio, X51V_GPIO_CF_READY);
+        qdev_connect_gpio_out(mpu->gpio, X51V_GPIO_CF_RESET,
+                              qemu_allocate_irq(x51v_cf_reset, lines, 0));
+        qemu_set_irq(lines->ready, lines->card != NULL);
     }
 
     /* Headphone jack on GPIO83, a switch like the power button:
