@@ -22,6 +22,7 @@
 #include "hw/display/intel-2700g.h"
 #include "monitor/qdev.h"
 #include "hw/ssi/ssi.h"
+#include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "exec/address-spaces.h"
 
@@ -35,6 +36,9 @@
 /* GPIOs (retropane-os docs/hw/touch.md, from AxDroid). */
 #define X51V_GPIO_TS_CS     24  /* TSC2046 chip select (active low) */
 #define X51V_GPIO_TS_PENIRQ 94  /* TSC2046 pen interrupt (low = touched) */
+/* SD slot, as measured on the owner's X51v (RetroPane docs/hw/sd.md). */
+#define X51V_GPIO_SD_DETECT 12  /* card detect (low = card in) */
+#define X51V_GPIO_SD_WP     27  /* write protect (high = locked) */
 
 /* SDRAM on SDCS2 (docs/hw in retropane-os). */
 #define X51V_SDRAM_BASE     0xa8000000
@@ -137,6 +141,13 @@ static void x51v_init(MachineState *machine)
                           qdev_get_gpio_in_named(ts, SSI_GPIO_CS, 0));
     qdev_connect_gpio_out(ts, 0,
                           qdev_get_gpio_in(mpu->gpio, X51V_GPIO_TS_PENIRQ));
+
+    /* SD slot switches: `-drive if=sd,readonly=on` reads as a locked card,
+     * no card as detect high. */
+    pxa2xx_mmci_handlers(mpu->mmc,
+                         qdev_get_gpio_in(mpu->gpio, X51V_GPIO_SD_WP),
+                         qemu_irq_invert(qdev_get_gpio_in(mpu->gpio,
+                                                          X51V_GPIO_SD_DETECT)));
 
     x51v_binfo.board_id = X51V_ARM_ID;
     arm_load_kernel(mpu->cpu, machine, &x51v_binfo);

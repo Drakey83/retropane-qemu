@@ -73,6 +73,10 @@ struct PXA2xxMMCIState {
      * does at one block (0.79 s, longer than the controller waits); alone
      * (CMD17) it reads. UINT32_MAX: none. */
     uint32_t slow_addr;
+    /* RetroPane: the slot's lock switch, as the host reads it. On a real
+     * card it is a mechanical tab the host is trusted to honour; the card
+     * stays writable, so a guest that ignores the switch is caught. */
+    bool locked;
 };
 
 static bool pxa2xx_mmci_vmstate_validate(void *opaque, int version_id)
@@ -543,7 +547,7 @@ static void pxa2xx_mmci_set_readonly(DeviceState *dev, bool readonly)
 {
     PXA2xxMMCIState *s = PXA2XX_MMCI(dev);
 
-    qemu_set_irq(s->readonly, readonly);
+    qemu_set_irq(s->readonly, readonly || s->locked);
 }
 
 void pxa2xx_mmci_handlers(PXA2xxMMCIState *s, qemu_irq readonly,
@@ -606,6 +610,7 @@ static void pxa2xx_mmci_instance_init(Object *obj)
 
 static Property pxa2xx_mmci_properties[] = {
     DEFINE_PROP_UINT32("slow-address", PXA2xxMMCIState, slow_addr, UINT32_MAX),
+    DEFINE_PROP_BOOL("locked", PXA2xxMMCIState, locked, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 
