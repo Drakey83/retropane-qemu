@@ -177,6 +177,8 @@ static void pxa2xx_mmci_int_update(PXA2xxMMCIState *s)
     qemu_set_irq(s->irq, !!(s->intreq & ~mask));
 }
 
+static void pxa2xx_mmci_wakequeues(PXA2xxMMCIState *s);
+
 static void pxa2xx_mmci_fifo_update(PXA2xxMMCIState *s)
 {
     if (!s->active)
@@ -208,9 +210,25 @@ static void pxa2xx_mmci_fifo_update(PXA2xxMMCIState *s)
             s->intreq |= INT_PRG_DONE;
             s->status |= STAT_PRG_DONE;
         }
+
+        /* A stop-transmission command queued during the transfer goes now. */
+        if (s->cmdreq && (s->cmdat & CMDAT_STOP_TRAN) &&
+            (s->status & STAT_CLK_EN)) {
+            s->status &= STAT_CLK_EN | STAT_DATA_DONE | STAT_PRG_DONE;
+            pxa2xx_mmci_wakequeues(s);
+        }
     }
 
     pxa2xx_mmci_int_update(s);
+}
+
+/* Whether a queued command may be issued now: a plain command at once, a
+ * stop-transmission command (CMDAT[10]) only once no data transfer is in
+ * progress. */
+static bool pxa2xx_mmci_can_issue(PXA2xxMMCIState *s)
+{
+    return s->cmdreq &&
+        (!(s->cmdat & CMDAT_STOP_TRAN) || !s->bytesleft);
 }
 
 static void pxa2xx_mmci_wakequeues(PXA2xxMMCIState *s)
@@ -365,7 +383,7 @@ static void pxa2xx_mmci_write(void *opaque,
             s->status |= STAT_CLK_EN;
             s->intreq &= ~INT_CLK_OFF;
 
-            if (s->cmdreq && !(s->cmdat & CMDAT_STOP_TRAN)) {
+            if (pxa2xx_mmci_can_issue(s)) {
                 s->status &= STAT_CLK_EN;
                 pxa2xx_mmci_wakequeues(s);
             }
@@ -394,9 +412,11 @@ static void pxa2xx_mmci_write(void *opaque,
 
     case MMC_CMDAT:
         s->cmdat = value & 0x3dff;
-        s->active = 0;
-        s->cmdreq = 1;
         if (!(value & CMDAT_STOP_TRAN)) {
+            s->active = 0;
+        }
+        s->cmdreq = 1;
+        if (pxa2xx_mmci_can_issue(s)) {
             s->status &= STAT_CLK_EN;
 
             if (s->status & STAT_CLK_EN)

@@ -131,6 +131,12 @@ struct SDState {
     uint8_t csd[16];
     uint16_t rca;
     uint32_t card_status;
+    /* RetroPane: status polls the card still answers "programming" after a
+     * write. A real card stays busy after the data (and after the CMD12 that
+     * ends a multi-block write); a driver that doesn't wait for READY_FOR_DATA
+     * gets no response to its next data command, as on the Dell Axim X51v's
+     * SDHC card. */
+    uint8_t prg_polls;
     uint8_t sd_status[64];
     union {
         uint8_t ext_csd[512];
@@ -1612,6 +1618,15 @@ static sd_rsp_type_t sd_cmd_SEND_CID(SDState *sd, SDRequest req)
     return sd_req_rca_same(sd, req) ? sd_r2_i : sd_r0;
 }
 
+/* A write's data has arrived: the card programs it, and stays busy (not
+ * ready for data, state "programming") for the next `polls` status polls. */
+static void sd_start_programming(SDState *sd, uint8_t polls)
+{
+    sd->state = sd_programming_state;
+    sd->prg_polls = polls;
+    sd->card_status &= ~READY_FOR_DATA;
+}
+
 /* CMD12 */
 static sd_rsp_type_t sd_cmd_STOP_TRANSMISSION(SDState *sd, SDRequest req)
 {
@@ -1620,10 +1635,8 @@ static sd_rsp_type_t sd_cmd_STOP_TRANSMISSION(SDState *sd, SDRequest req)
         sd->state = sd_transfer_state;
         return sd_r1b;
     case sd_receivingdata_state:
-        sd->state = sd_programming_state;
-        /* Bzzzzzzztt .... Operation complete.  */
-        sd->state = sd_transfer_state;
-        return sd_r1;
+        sd_start_programming(sd, 3);
+        return sd_r1b;
     default:
         return sd_invalid_state_for_cmd(sd, req);
     }
@@ -1634,6 +1647,14 @@ static sd_rsp_type_t sd_cmd_SEND_STATUS(SDState *sd, SDRequest req)
 {
     if (sd->mode != sd_data_transfer_mode) {
         return sd_invalid_mode_for_cmd(sd, req);
+    }
+
+    /* Programming finishes after a few polls (the response still carries
+     * the state before this command, so this poll reports "programming"). */
+    if (sd->state == sd_programming_state && sd->prg_polls > 0 &&
+        --sd->prg_polls == 0) {
+        sd->state = sd_transfer_state;
+        sd->card_status |= READY_FOR_DATA;
     }
 
     switch (sd->state) {
@@ -2376,8 +2397,8 @@ void sd_write_byte(SDState *sd, uint8_t value)
             sd_blk_write(sd, sd->data_start, sd->data_offset);
             sd->blk_written ++;
             sd->csd[14] |= 0x40;
-            /* Bzzzzzzztt .... Operation complete.  */
-            sd->state = sd_transfer_state;
+            /* Busy until the status polls say otherwise (RetroPane). */
+            sd_start_programming(sd, 2);
         }
         break;
 
