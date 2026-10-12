@@ -384,6 +384,19 @@ static uint64_t pxa2xx_mmci_read(void *opaque, hwaddr offset, unsigned size)
         }
         s->intreq &= ~INT_RXFIFO_REQ;
         pxa2xx_mmci_fifo_update(s);
+        if (!s->active) {
+            /*
+             * After the last byte has come from the card, the request
+             * follows what is left in the FIFO, as on the hardware, and the
+             * DMA request line with it: left raised once the FIFO is empty,
+             * it starts the next transfer's DMA before that transfer's
+             * command has been sent, reading nothing.
+             */
+            if (s->rx_len) {
+                s->intreq |= INT_RXFIFO_REQ;
+            }
+            pxa2xx_mmci_int_update(s);
+        }
         break;
     case MMC_RDWAIT:
         break;

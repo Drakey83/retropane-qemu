@@ -18,6 +18,7 @@
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define PXA255_DMA_NUM_CHANNELS 16
@@ -59,6 +60,15 @@ struct PXA2xxDMAState {
 
     /* Flag to avoid recursive DMA invocations.  */
     int running;
+    /*
+     * Requests are served from a timer on the virtual clock, as the
+     * hardware serves them asynchronously: run synchronously, a request
+     * raised inside a peripheral's register access (the MMC controller's
+     * FIFO filling) would re-enter that peripheral to read its FIFO, which
+     * QEMU blocks. The virtual clock (not a bottom half) keeps the timing
+     * deterministic under -icount, which the benchmarks rely on.
+     */
+    QEMUTimer *timer;
 };
 
 #define DCSR0	0x0000	/* DMA Control / Status register for Channel 0 */
@@ -253,8 +263,12 @@ static void pxa2xx_dma_run(PXA2xxDMAState *s)
                         break;
                     }
 
-                    ch->state |= DCSR_STOPINTR;
-                    break;
+                    /*
+                     * Not the last descriptor: the hardware fetches the
+                     * next and carries on (the channel stops only at a
+                     * STOP descriptor).
+                     */
+                    pxa2xx_dma_descriptor_fetch(s, c);
                 }
             }
         }
@@ -455,7 +469,17 @@ static void pxa2xx_dma_request(void *opaque, int req_num, int on)
 
     s->chan[ch].request = on;
     if (on) {
-        pxa2xx_dma_run(s);
+        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
+}
+
+static void pxa2xx_dma_deferred(void *opaque)
+{
+    PXA2xxDMAState *s = opaque;
+    int ch;
+
+    pxa2xx_dma_run(s);
+    for (ch = 0; ch < s->channels; ch++) {
         pxa2xx_dma_update(s, ch);
     }
 }
@@ -490,6 +514,7 @@ static void pxa2xx_dma_realize(DeviceState *dev, Error **errp)
 
     for (i = 0; i < s->channels; i ++)
         s->chan[i].state = DCSR_STOPINTR;
+    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pxa2xx_dma_deferred, s);
 }
 
 DeviceState *pxa27x_dma_init(hwaddr base, qemu_irq irq)
