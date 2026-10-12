@@ -196,6 +196,9 @@ struct Pxa27xUdcState {
     bool chr_open;
     /* The open requests: 0 not sent, 1/2 in progress, 3 done. */
     uint32_t open_step;
+    /* The host accepts composite (IAD, class 0xEF) devices; off plays a
+     * host that doesn't, to test a guest's fallback layout. */
+    bool accept_composite;
 };
 
 static void udc_update_irq(Pxa27xUdcState *s)
@@ -444,6 +447,9 @@ static void host_script_check(Pxa27xUdcState *s)
     case 1: case 3:
         if (s->resp_len < 8 || s->resp[1] != 1) {
             host_fail(s, "bad device descriptor");
+        } else if (s->step == 3 && !s->accept_composite &&
+                   s->resp_len >= 5 && s->resp[4] == 0xEF) {
+            host_fail(s, "this host doesn't take composite devices");
         }
         break;
     case 4:
@@ -957,6 +963,8 @@ static void udc_realize(DeviceState *dev, Error **errp)
 static Property udc_properties[] = {
     DEFINE_PROP_CHR("chardev", Pxa27xUdcState, chr),
     DEFINE_PROP_CHR("msc", Pxa27xUdcState, msc),
+    DEFINE_PROP_BOOL("accept-composite", Pxa27xUdcState, accept_composite,
+                     true),
     DEFINE_PROP_END_OF_LIST(),
 };
 
