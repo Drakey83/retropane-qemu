@@ -121,6 +121,7 @@ config X51V
     select PXA27X_PWM
     select SSI
     select TSC2046
+    select MICRODRIVE
 
 config MPS3R
     bool

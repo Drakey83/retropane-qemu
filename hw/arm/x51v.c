@@ -24,6 +24,8 @@
 #include "hw/ssi/ssi.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
+#include "hw/pcmcia.h"
+#include "sysemu/blockdev.h"
 #include "exec/address-spaces.h"
 
 /* Static memory chip selects (PXA27x Developer's Manual, memory map). */
@@ -40,6 +42,7 @@
 #define X51V_GPIO_SD_DETECT 12  /* card detect (low = card in) */
 #define X51V_GPIO_SD_WP     27  /* write protect (high = locked) */
 #define X51V_GPIO_POWER     0   /* power button (low at rest) */
+#define X51V_GPIO_CF_DETECT 13  /* CF card detect (low = card in) */
 
 /* SDRAM on SDCS2 (docs/hw in retropane-os). */
 #define X51V_SDRAM_BASE     0xa8000000
@@ -164,6 +167,22 @@ static void x51v_init(MachineState *machine)
                          qdev_get_gpio_in(mpu->gpio, X51V_GPIO_SD_WP),
                          qemu_irq_invert(qdev_get_gpio_in(mpu->gpio,
                                                           X51V_GPIO_SD_DETECT)));
+
+    /* CompactFlash slot, PC Card socket 1: `-drive if=ide,file=cf.img`
+     * puts a CF card in it (QEMU's microdrive model: CIS, memory and I/O
+     * modes, ATA). Detect on GPIO13, low with a card; an empty slot reads
+     * high. The card's ready/IRQ line (GPIO84) is not modelled. */
+    {
+        qemu_irq cd = qemu_irq_invert(qdev_get_gpio_in(mpu->gpio,
+                                                       X51V_GPIO_CF_DETECT));
+        DriveInfo *cf = drive_get(IF_IDE, 0, 0);
+
+        pxa2xx_pcmcia_set_irq_cb(mpu->pcmcia[1], NULL, cd);
+        qemu_irq_lower(cd);
+        if (cf) {
+            pxa2xx_pcmcia_attach(mpu->pcmcia[1], dscm1xxxx_init(cf));
+        }
+    }
 
     x51v_binfo.board_id = X51V_ARM_ID;
     arm_load_kernel(mpu->cpu, machine, &x51v_binfo);
