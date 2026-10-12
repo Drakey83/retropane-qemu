@@ -122,6 +122,8 @@ config X51V
     select SSI
     select TSC2046
     select MICRODRIVE
+    select WM8750
+    select I2C
 
 config MPS3R
     bool

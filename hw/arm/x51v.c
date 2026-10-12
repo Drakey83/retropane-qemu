@@ -25,6 +25,8 @@
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/pcmcia.h"
+#include "hw/i2c/i2c.h"
+#include "hw/audio/wm8750.h"
 #include "sysemu/blockdev.h"
 #include "exec/address-spaces.h"
 
@@ -43,6 +45,7 @@
 #define X51V_GPIO_SD_WP     27  /* write protect (high = locked) */
 #define X51V_GPIO_POWER     0   /* power button (low at rest) */
 #define X51V_GPIO_CF_DETECT 13  /* CF card detect (low = card in) */
+#define X51V_WM8750_ADDR    0x1a /* codec on the I2C bus (CSB unknown: 0x1a or 0x1b) */
 
 /* SDRAM on SDCS2 (docs/hw in retropane-os). */
 #define X51V_SDRAM_BASE     0xa8000000
@@ -184,6 +187,24 @@ static void x51v_init(MachineState *machine)
         }
     }
 
+    /* Audio: a WM8750 codec on the PXA I2C bus, fed by the I2S controller
+     * (docs/research/hardware-inventory.md). `-machine audiodev=ID` picks
+     * the output (tests record a wav). The amplifier (GPIO82, CPLD 0x14)
+     * and headphone detect (GPIO83) are not modelled. */
+    {
+        I2CSlave *codec = i2c_slave_new(TYPE_WM8750, X51V_WM8750_ADDR);
+
+        if (machine->audiodev) {
+            qdev_prop_set_string(DEVICE(codec), "audiodev", machine->audiodev);
+        }
+        i2c_slave_realize_and_unref(codec, pxa2xx_i2c_bus(mpu->i2c[0]),
+                                    &error_fatal);
+        mpu->i2s->opaque = codec;
+        mpu->i2s->codec_out = wm8750_dac_dat;
+        mpu->i2s->codec_in = wm8750_adc_dat;
+        wm8750_data_req_set(DEVICE(codec), mpu->i2s->data_req, mpu->i2s);
+    }
+
     x51v_binfo.board_id = X51V_ARM_ID;
     arm_load_kernel(mpu->cpu, machine, &x51v_binfo);
 }
@@ -194,6 +215,7 @@ static void x51v_machine_init(MachineClass *mc)
     mc->init = x51v_init;
     mc->ignore_memory_transaction_failures = true;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("pxa270-c5");
+    machine_add_audiodev_property(mc);
 }
 
 DEFINE_MACHINE("x51v", x51v_machine_init)
