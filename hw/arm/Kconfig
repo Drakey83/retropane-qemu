@@ -118,6 +118,7 @@ config X51V
     select INTEL_2700G
     select X51V_CPLD
     select PXA27X_UDC
+    select PXA27X_PWM
     select SSI
     select TSC2046
 

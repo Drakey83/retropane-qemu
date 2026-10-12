@@ -142,6 +142,14 @@ static void x51v_init(MachineState *machine)
     qdev_connect_gpio_out(ts, 0,
                           qdev_get_gpio_in(mpu->gpio, X51V_GPIO_TS_PENIRQ));
 
+    /* PWM0-3 (PWM0: the backlight), registers readable by tests through
+     * `qom-get /machine/peripheral/pwm dcr0`. */
+    DeviceState *pwm = qdev_new("pxa27x-pwm");
+    qdev_set_id(pwm, g_strdup("pwm"), &error_fatal);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(pwm), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pwm), 0, 0x40B00000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pwm), 1, 0x40C00000);
+
     /* SD slot switches: `-drive if=sd,readonly=on` reads as a locked card,
      * no card as detect high. */
     pxa2xx_mmci_handlers(mpu->mmc,
