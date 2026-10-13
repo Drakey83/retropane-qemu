@@ -31,6 +31,10 @@ struct PXA2xxPCMCIAState {
     qemu_irq cd_irq;
 
     PCMCIACardState *card;
+    /* Board switched the socket's power off (or holds the card in reset):
+     * the card doesn't answer, reads float to 0. Off only on boards that
+     * call pxa2xx_pcmcia_set_power(). */
+    bool off;
 };
 
 static uint64_t pxa2xx_pcmcia_common_read(void *opaque,
@@ -39,7 +43,7 @@ static uint64_t pxa2xx_pcmcia_common_read(void *opaque,
     PXA2xxPCMCIAState *s = (PXA2xxPCMCIAState *) opaque;
     PCMCIACardClass *pcc;
 
-    if (s->slot.attached) {
+    if (s->slot.attached && !s->off) {
         pcc = PCMCIA_CARD_GET_CLASS(s->card);
         return pcc->common_read(s->card, offset);
     }
@@ -53,7 +57,7 @@ static void pxa2xx_pcmcia_common_write(void *opaque, hwaddr offset,
     PXA2xxPCMCIAState *s = (PXA2xxPCMCIAState *) opaque;
     PCMCIACardClass *pcc;
 
-    if (s->slot.attached) {
+    if (s->slot.attached && !s->off) {
         pcc = PCMCIA_CARD_GET_CLASS(s->card);
         pcc->common_write(s->card, offset, value);
     }
@@ -65,7 +69,7 @@ static uint64_t pxa2xx_pcmcia_attr_read(void *opaque,
     PXA2xxPCMCIAState *s = (PXA2xxPCMCIAState *) opaque;
     PCMCIACardClass *pcc;
 
-    if (s->slot.attached) {
+    if (s->slot.attached && !s->off) {
         pcc = PCMCIA_CARD_GET_CLASS(s->card);
         return pcc->attr_read(s->card, offset);
     }
@@ -79,7 +83,7 @@ static void pxa2xx_pcmcia_attr_write(void *opaque, hwaddr offset,
     PXA2xxPCMCIAState *s = (PXA2xxPCMCIAState *) opaque;
     PCMCIACardClass *pcc;
 
-    if (s->slot.attached) {
+    if (s->slot.attached && !s->off) {
         pcc = PCMCIA_CARD_GET_CLASS(s->card);
         pcc->attr_write(s->card, offset, value);
     }
@@ -91,7 +95,7 @@ static uint64_t pxa2xx_pcmcia_io_read(void *opaque,
     PXA2xxPCMCIAState *s = (PXA2xxPCMCIAState *) opaque;
     PCMCIACardClass *pcc;
 
-    if (s->slot.attached) {
+    if (s->slot.attached && !s->off) {
         pcc = PCMCIA_CARD_GET_CLASS(s->card);
         return pcc->io_read(s->card, offset);
     }
@@ -105,7 +109,7 @@ static void pxa2xx_pcmcia_io_write(void *opaque, hwaddr offset,
     PXA2xxPCMCIAState *s = (PXA2xxPCMCIAState *) opaque;
     PCMCIACardClass *pcc;
 
-    if (s->slot.attached) {
+    if (s->slot.attached && !s->off) {
         pcc = PCMCIA_CARD_GET_CLASS(s->card);
         pcc->io_write(s->card, offset, value);
     }
@@ -223,6 +227,15 @@ int pxa2xx_pcmcia_detach(void *opaque)
     }
 
     return 0;
+}
+
+/* Board power switch (and reset) for the socket: while off, the card's
+ * windows read 0 and ignore writes. Card state across power-up is the
+ * board's business (it resets the card). */
+void pxa2xx_pcmcia_set_power(void *opaque, bool on)
+{
+    PXA2xxPCMCIAState *s = (PXA2xxPCMCIAState *) opaque;
+    s->off = !on;
 }
 
 /* Who to notify on card events */

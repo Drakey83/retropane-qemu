@@ -45,8 +45,7 @@
 #define X51V_GPIO_SD_WP     27  /* write protect (high = locked) */
 #define X51V_GPIO_POWER     0   /* power button (low at rest) */
 #define X51V_GPIO_CF_DETECT 13  /* CF card detect (low = card in) */
-#define X51V_GPIO_CF_RESET  36  /* CF RESET (output, high = held in reset) */
-#define X51V_GPIO_CF_READY  84  /* CF READY (high = ready) */
+#define X51V_GPIO_CF_READY  84  /* CF slot powered (high) */
 #define X51V_GPIO_HP_DETECT 83  /* headphone jack (assumed high = plugged) */
 #define X51V_WM8750_ADDR    0x1a /* codec on the I2C bus (CSB unknown: 0x1a or 0x1b) */
 
@@ -86,31 +85,50 @@ static struct arm_boot_info x51v_binfo = {
 };
 
 /*
- * The CF socket's RESET and READY lines (AxDroid's board code; retropane-os
- * docs/hw/cf.md). READY is modelled as "a card is in and not held in
- * reset": QEMU's card answers at once, so its busy times after a reset or
- * a command are not modelled. Releasing RESET resets the card to its
- * power-on state (memory mode, idle), as a hardware reset does.
+ * The CF slot's power and RESET, both CPLD outputs, and READY on GPIO84
+ * (retropane-os docs/hw/cf.md "Slot power and reset", from Dell's socket
+ * driver and device runs). The slot starts unpowered, as Windows Mobile
+ * hands over: the card answers (and GPIO84 reads high) only once software
+ * switches both power bits on, so a driver without the power sequence reads
+ * zeros, as on the device. Power-up and the release of RESET put the card in
+ * its power-on state (memory mode, idle); while RESET is held the card
+ * doesn't answer, but GPIO84 stays high (it shows slot power, measured).
+ * QEMU's card answers at once: busy times are not modelled.
  */
 typedef struct {
+    void *socket;
     PCMCIACardState *card;
     qemu_irq ready;
+    bool powered;
     bool held;
-} X51vCfLines;
+} X51vCfSlot;
+
+static void x51v_cf_update(X51vCfSlot *c)
+{
+    pxa2xx_pcmcia_set_power(c->socket, c->powered && !c->held);
+    qemu_set_irq(c->ready, c->card && c->powered);
+}
+
+static void x51v_cf_power(void *opaque, int n, int level)
+{
+    X51vCfSlot *c = opaque;
+
+    if (level && !c->powered && c->card) {
+        device_cold_reset(DEVICE(c->card));
+    }
+    c->powered = level;
+    x51v_cf_update(c);
+}
 
 static void x51v_cf_reset(void *opaque, int n, int level)
 {
-    X51vCfLines *l = opaque;
+    X51vCfSlot *c = opaque;
 
-    if (level && !l->held) {
-        l->held = true;
-    } else if (!level && l->held) {
-        l->held = false;
-        if (l->card) {
-            device_cold_reset(DEVICE(l->card));
-        }
+    if (!level && c->held && c->powered && c->card) {
+        device_cold_reset(DEVICE(c->card));
     }
-    qemu_set_irq(l->ready, l->card && !l->held);
+    c->held = level;
+    x51v_cf_update(c);
 }
 
 static void x51v_init(MachineState *machine)
@@ -154,10 +172,16 @@ static void x51v_init(MachineState *machine)
                                 X51V_CS3_2700G + INTEL_2700G_VRAM_SIZE,
                                 INTEL_2700G_REG_OFFSET - INTEL_2700G_VRAM_SIZE);
 
-    /* Board CPLD on CS4 (power rails, LCD type). */
+    /* Board CPLD on CS4 (power rails, resets, LCD type). Its backlight
+     * enable (0x18 bit 2) lights the panel; its CF outputs are wired with
+     * the CF slot below. */
+    DriveInfo *cf = drive_get(IF_IDE, 0, 0);
     DeviceState *cpld = qdev_new("x51v-cpld");
     qdev_set_id(cpld, g_strdup("cpld"), &error_fatal);
+    qdev_prop_set_bit(cpld, "cf-present", cf != NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(cpld), &error_fatal);
+    qdev_connect_gpio_out_named(cpld, "backlight", 0,
+                                qdev_get_gpio_in_named(gpu, "backlight", 0));
     sysbus_mmio_map(SYS_BUS_DEVICE(cpld), 0, X51V_CS4_CPLD);
 
     /*
@@ -205,24 +229,27 @@ static void x51v_init(MachineState *machine)
     /* CompactFlash slot, PC Card socket 1: `-drive if=ide,file=cf.img`
      * puts a CF card in it (QEMU's microdrive model: CIS, memory and I/O
      * modes, ATA). Detect on GPIO13, low with a card; an empty slot reads
-     * high. RESET on GPIO36, READY on GPIO84 (x51v_cf_reset). The card's
-     * interrupt is not modelled (memory mode, polled). */
+     * high (and CPLD 0x04 bit 1 set). Power and RESET from the CPLD, READY
+     * on GPIO84 (x51v_cf_power). The card's interrupt is not modelled
+     * (memory mode, polled). */
     {
         qemu_irq cd = qemu_irq_invert(qdev_get_gpio_in(mpu->gpio,
                                                        X51V_GPIO_CF_DETECT));
-        DriveInfo *cf = drive_get(IF_IDE, 0, 0);
-        X51vCfLines *lines = g_new0(X51vCfLines, 1);
+        X51vCfSlot *slot = g_new0(X51vCfSlot, 1);
 
+        slot->socket = mpu->pcmcia[1];
         pxa2xx_pcmcia_set_irq_cb(mpu->pcmcia[1], NULL, cd);
         qemu_irq_lower(cd);
         if (cf) {
-            lines->card = dscm1xxxx_init(cf);
-            pxa2xx_pcmcia_attach(mpu->pcmcia[1], lines->card);
+            slot->card = dscm1xxxx_init(cf);
+            pxa2xx_pcmcia_attach(mpu->pcmcia[1], slot->card);
         }
-        lines->ready = qdev_get_gpio_in(mpu->gpio, X51V_GPIO_CF_READY);
-        qdev_connect_gpio_out(mpu->gpio, X51V_GPIO_CF_RESET,
-                              qemu_allocate_irq(x51v_cf_reset, lines, 0));
-        qemu_set_irq(lines->ready, lines->card != NULL);
+        slot->ready = qdev_get_gpio_in(mpu->gpio, X51V_GPIO_CF_READY);
+        qdev_connect_gpio_out_named(cpld, "cf-power", 0,
+                                    qemu_allocate_irq(x51v_cf_power, slot, 0));
+        qdev_connect_gpio_out_named(cpld, "cf-reset", 0,
+                                    qemu_allocate_irq(x51v_cf_reset, slot, 0));
+        x51v_cf_update(slot);
     }
 
     /* Headphone jack on GPIO83, a switch like the power button:

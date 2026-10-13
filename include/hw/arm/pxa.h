@@ -103,6 +103,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(PXA2xxPCMCIAState, PXA2XX_PCMCIA)
 int pxa2xx_pcmcia_attach(void *opaque, PCMCIACardState *card);
 int pxa2xx_pcmcia_detach(void *opaque);
 void pxa2xx_pcmcia_set_irq_cb(void *opaque, qemu_irq irq, qemu_irq cd_irq);
+void pxa2xx_pcmcia_set_power(void *opaque, bool on);
 
 /* pxa2xx_keypad.c */
 struct  keymap {

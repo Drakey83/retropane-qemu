@@ -16,6 +16,11 @@
  * Not modelled (the registers just read back what was written): the MBX 3D
  * core, the MVED1 decoder, the hardware cursor, colour keys, gamma, the
  * video scaler (the video plane is shown 1:1) and the PLLs.
+ *
+ * The panel's backlight is not the 2700G's, but it decides what the screen
+ * shows: the "backlight" GPIO input (the X51v's CPLD 0x18 bit 2) low shows
+ * black with the picture kept in memory, as on the device. Tests read it
+ * with `qom-get /machine/peripheral/mbx2700g backlight`.
  */
 
 #include "qemu/osdep.h"
@@ -103,6 +108,7 @@ struct Intel2700GState {
     MemoryRegion regs_mr;
     QemuConsole *con;
     uint32_t regs[NREGS];
+    bool dark;      /* backlight input low; an input level, kept on reset */
 };
 
 static uint64_t i2700g_read(void *opaque, hwaddr addr, unsigned size)
@@ -385,8 +391,8 @@ static void i2700g_update(void *opaque)
         for (int x = 0; x < width; x++) {
             int r = (bg >> 16) & 0xFF, g = (bg >> 8) & 0xFF, b = bg & 0xFF;
 
-            if (!sync) {
-                row[x] = 0;             /* display off: black */
+            if (!sync || s->dark) {
+                row[x] = 0;             /* display or backlight off: black */
                 continue;
             }
             for (int i = 0; i < n; i++) {
@@ -422,6 +428,18 @@ static void i2700g_update(void *opaque)
     dpy_gfx_update_full(s->con);
 }
 
+static void i2700g_set_backlight(void *opaque, int n, int level)
+{
+    Intel2700GState *s = opaque;
+
+    s->dark = !level;
+}
+
+static bool i2700g_get_backlight(Object *obj, Error **errp)
+{
+    return !INTEL_2700G(obj)->dark;
+}
+
 static void i2700g_invalidate(void *opaque)
 {
 }
@@ -452,14 +470,18 @@ static void i2700g_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->vram);
     sysbus_init_mmio(sbd, &s->regs_mr);
     s->con = graphic_console_init(dev, 0, &i2700g_gfx_ops, s);
+    qdev_init_gpio_in_named(dev, i2700g_set_backlight, "backlight", 1);
+    object_property_add_bool(OBJECT(dev), "backlight", i2700g_get_backlight,
+                             NULL);
 }
 
 static const VMStateDescription vmstate_i2700g = {
     .name = "intel-2700g",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Intel2700GState, NREGS),
+        VMSTATE_BOOL(dark, Intel2700GState),
         VMSTATE_END_OF_LIST()
     },
 };
