@@ -34,15 +34,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(TSC2046State, TSC2046)
 #define CB_PD       0x03
 
 /*
- * The owner's X51v, measured 2026-10-13 (retropane-os docs/hw/touch.md):
- * the X channel follows the screen's vertical axis, 99 at the top to 2741
- * at the bottom; the Y channel the horizontal axis, mirrored: 3719 at the
- * left to 319 at the right.
+ * The owner's X51v as its align screen measured it (2026-10-13,
+ * retropane-os rp_touch_cal::Calibration::X51V_DEFAULT): screen =
+ * ((a rx + b ry + c) / 65536, (d rx + e ry + f) / 65536). The model is
+ * its exact inverse, so a tap here reads what it reads on the device: the
+ * X channel follows the vertical (~195 at the top to ~3207 at the bottom),
+ * the Y channel the horizontal mirrored (~3696 left to ~330 right), with
+ * the panel's slight skew.
  */
-#define VERT_TOP     99
-#define VERT_BOTTOM  2741
-#define HORIZ_LEFT   3719
-#define HORIZ_RIGHT  319
+#define CAL_A  (-43.0)
+#define CAL_B  (-9345.0)
+#define CAL_C  34538826.0
+#define CAL_D  13925.0
+#define CAL_E  (-54.0)
+#define CAL_F  (-2709680.0)
+#define SCREEN_W 480
+#define SCREEN_H 640
 
 /*
  * Settling, as measured: after a power-down (PD = 00) or a change of
@@ -129,9 +136,17 @@ static void tsc2046_mouse_event(void *opaque, int x, int y, int z,
 
     if (touched) {
         /* x, y arrive in 0..0x7FFF across the screen. */
-        int horiz = HORIZ_LEFT + ((HORIZ_RIGHT - HORIZ_LEFT) * x) / 0x7FFF;
-        int vert = VERT_TOP + ((VERT_BOTTOM - VERT_TOP) * y) / 0x7FFF;
-        int rx = horiz;
+        double sx = (double)x * (SCREEN_W - 1) / 0x7FFF;
+        double sy = (double)y * (SCREEN_H - 1) / 0x7FFF;
+        /* Invert the calibration: [a b; d e] (rx ry)' = 65536 (sx sy)' - (c f)'. */
+        double u = 65536.0 * sx - CAL_C, v = 65536.0 * sy - CAL_F;
+        double det = CAL_A * CAL_E - CAL_B * CAL_D;
+        int vert = (int)((CAL_E * u - CAL_B * v) / det + 0.5);   /* X channel */
+        int horiz = (int)((CAL_A * v - CAL_D * u) / det + 0.5);  /* Y channel */
+        int rx;
+        vert = vert < 0 ? 0 : vert > 4095 ? 4095 : vert;
+        horiz = horiz < 0 ? 0 : horiz > 4095 ? 4095 : horiz;
+        rx = horiz;
         s->value[5] = vert;                 /* X channel: screen vertical */
         s->value[1] = horiz;                /* Y channel: screen horizontal */
         s->value[3] = 600;                  /* Z1 */
