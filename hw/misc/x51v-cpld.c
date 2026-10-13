@@ -64,7 +64,7 @@ struct X51vCpldState {
     uint16_t regs[NREGS];   /* the output latches (write-only) */
     qemu_irq out[NOUTS];
     uint8_t panel_id;   /* 0 = 3.7" Sharp VGA (default), 2 = 3.7" Samsung VGA */
-    bool cf_present;    /* set by the machine when a CF card is in */
+    bool cf_present;    /* "cf-present" input: a CF card is in (a level) */
 };
 
 static void cpld_update_outputs(X51vCpldState *s)
@@ -75,6 +75,11 @@ static void cpld_update_outputs(X51vCpldState *s)
     qemu_set_irq(s->out[OUT_CF_RESET], !!(s->regs[R_CTL18 / 2] & CF_RESET));
     qemu_set_irq(s->out[OUT_BACKLIGHT],
                  !!(s->regs[R_CTL18 / 2] & BACKLIGHT_EN));
+}
+
+static void cpld_set_cf_present(void *opaque, int n, int level)
+{
+    X51V_CPLD(opaque)->cf_present = level;
 }
 
 static uint64_t cpld_read(void *opaque, hwaddr addr, unsigned size)
@@ -127,6 +132,7 @@ static void cpld_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(dev), &cpld_ops, s,
                           "x51v-cpld", NREGS * 2);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    qdev_init_gpio_in_named(dev, cpld_set_cf_present, "cf-present", 1);
     qdev_init_gpio_out_named(dev, &s->out[OUT_CF_POWER], "cf-power", 1);
     qdev_init_gpio_out_named(dev, &s->out[OUT_CF_RESET], "cf-reset", 1);
     qdev_init_gpio_out_named(dev, &s->out[OUT_BACKLIGHT], "backlight", 1);
@@ -134,7 +140,6 @@ static void cpld_realize(DeviceState *dev, Error **errp)
 
 static Property cpld_properties[] = {
     DEFINE_PROP_UINT8("panel-id", X51vCpldState, panel_id, 0),
-    DEFINE_PROP_BOOL("cf-present", X51vCpldState, cf_present, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -144,6 +149,7 @@ static const VMStateDescription vmstate_cpld = {
     .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16_ARRAY(regs, X51vCpldState, NREGS),
+        VMSTATE_BOOL(cf_present, X51vCpldState),
         VMSTATE_END_OF_LIST()
     },
 };

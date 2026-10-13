@@ -94,11 +94,18 @@ static struct arm_boot_info x51v_binfo = {
  * its power-on state (memory mode, idle); while RESET is held the card
  * doesn't answer, but GPIO84 stays high (it shows slot power, measured).
  * QEMU's card answers at once: busy times are not modelled.
+ *
+ * Tests pull the card out and push it back in through the "cfslot" switch:
+ * `qom-set /machine/peripheral/cfslot pressed true` ejects it (GPIO13 high,
+ * CPLD 0x04 bit 1 set, GPIO84 low), `false` re-inserts it; a card going
+ * into a powered slot starts from its power-on state.
  */
 typedef struct {
     void *socket;
-    PCMCIACardState *card;
+    PCMCIACardState *card;     /* the card image, in the slot or not */
     qemu_irq ready;
+    qemu_irq present;          /* to the CPLD's status register */
+    bool in;
     bool powered;
     bool held;
 } X51vCfSlot;
@@ -106,14 +113,15 @@ typedef struct {
 static void x51v_cf_update(X51vCfSlot *c)
 {
     pxa2xx_pcmcia_set_power(c->socket, c->powered && !c->held);
-    qemu_set_irq(c->ready, c->card && c->powered);
+    qemu_set_irq(c->ready, c->in && c->powered);
+    qemu_set_irq(c->present, c->in);
 }
 
 static void x51v_cf_power(void *opaque, int n, int level)
 {
     X51vCfSlot *c = opaque;
 
-    if (level && !c->powered && c->card) {
+    if (level && !c->powered && c->in) {
         device_cold_reset(DEVICE(c->card));
     }
     c->powered = level;
@@ -124,10 +132,28 @@ static void x51v_cf_reset(void *opaque, int n, int level)
 {
     X51vCfSlot *c = opaque;
 
-    if (!level && c->held && c->powered && c->card) {
+    if (!level && c->held && c->powered && c->in) {
         device_cold_reset(DEVICE(c->card));
     }
     c->held = level;
+    x51v_cf_update(c);
+}
+
+static void x51v_cf_eject(void *opaque, int n, int level)
+{
+    X51vCfSlot *c = opaque;
+
+    if (!c->card || c->in == !level) {
+        return;
+    }
+    if (level) {
+        pxa2xx_pcmcia_detach(c->socket);
+        c->in = false;
+    } else {
+        device_cold_reset(DEVICE(c->card));
+        pxa2xx_pcmcia_attach(c->socket, c->card);
+        c->in = true;
+    }
     x51v_cf_update(c);
 }
 
@@ -178,7 +204,6 @@ static void x51v_init(MachineState *machine)
     DriveInfo *cf = drive_get(IF_IDE, 0, 0);
     DeviceState *cpld = qdev_new("x51v-cpld");
     qdev_set_id(cpld, g_strdup("cpld"), &error_fatal);
-    qdev_prop_set_bit(cpld, "cf-present", cf != NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(cpld), &error_fatal);
     qdev_connect_gpio_out_named(cpld, "backlight", 0,
                                 qdev_get_gpio_in_named(gpu, "backlight", 0));
@@ -243,13 +268,21 @@ static void x51v_init(MachineState *machine)
         if (cf) {
             slot->card = dscm1xxxx_init(cf);
             pxa2xx_pcmcia_attach(mpu->pcmcia[1], slot->card);
+            slot->in = true;
         }
         slot->ready = qdev_get_gpio_in(mpu->gpio, X51V_GPIO_CF_READY);
+        slot->present = qdev_get_gpio_in_named(cpld, "cf-present", 0);
         qdev_connect_gpio_out_named(cpld, "cf-power", 0,
                                     qemu_allocate_irq(x51v_cf_power, slot, 0));
         qdev_connect_gpio_out_named(cpld, "cf-reset", 0,
                                     qemu_allocate_irq(x51v_cf_reset, slot, 0));
         x51v_cf_update(slot);
+
+        DeviceState *eject = qdev_new("x51v-button");
+        qdev_set_id(eject, g_strdup("cfslot"), &error_fatal);
+        qdev_realize_and_unref(eject, NULL, &error_fatal);
+        qdev_connect_gpio_out(eject, 0,
+                              qemu_allocate_irq(x51v_cf_eject, slot, 0));
     }
 
     /* Headphone jack on GPIO83, a switch like the power button:
