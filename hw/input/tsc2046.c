@@ -31,10 +31,28 @@ OBJECT_DECLARE_SIMPLE_TYPE(TSC2046State, TSC2046)
 
 #define CB_START    0x80
 #define CB_MODE8    0x08
+#define CB_PD       0x03
 
-/* Raw 12-bit range reported across the panel (typical for a 3.7" panel). */
-#define RAW_MIN     200
-#define RAW_MAX     3900
+/*
+ * The owner's X51v, measured 2026-10-13 (retropane-os docs/hw/touch.md):
+ * the X channel follows the screen's vertical axis, 99 at the top to 2741
+ * at the bottom; the Y channel the horizontal axis, mirrored: 3719 at the
+ * left to 319 at the right.
+ */
+#define VERT_TOP     99
+#define VERT_BOTTOM  2741
+#define HORIZ_LEFT   3719
+#define HORIZ_RIGHT  319
+
+/*
+ * Settling, as measured: after a power-down (PD = 00) or a change of
+ * channel, a position conversion starts far from the pen's value (the X
+ * plate near 0, the Y plate near 4095) and each further conversion with
+ * the converter on moves 30% of the remaining way, so drivers need 10-20
+ * conversions to agree. Drivers reading once got every tap at an edge.
+ */
+#define SETTLE_START_X  150
+#define SETTLE_START_Y  3850
 
 struct TSC2046State {
     SSIPeripheral ssidev;
@@ -44,6 +62,8 @@ struct TSC2046State {
     bool touched;
     uint32_t phase;     /* 0 = expecting control byte, 1-2 = result bytes */
     uint16_t result;    /* current conversion, left-aligned per mode */
+    uint8_t last_cmd;   /* previous control byte (its PD bits and channel) */
+    int level;          /* the settling line's value for that channel */
 };
 
 static void tsc2046_update_penirq(TSC2046State *s)
@@ -59,8 +79,19 @@ static uint32_t tsc2046_transfer(SSIPeripheral *dev, uint32_t tx)
     switch (s->phase) {
     case 0:
         if (tx & CB_START) {
-            uint16_t v = s->touched || ((tx >> 4) & 7) == 0 ||
-                         ((tx >> 4) & 7) >= 6 ? s->value[(tx >> 4) & 7] : 0;
+            int ch = (tx >> 4) & 7;
+            uint16_t v = s->touched || ch == 0 || ch >= 6 ? s->value[ch] : 0;
+            if (s->touched && (ch == 5 || ch == 1)) {
+                /* A fresh start after power-down or another channel. */
+                bool fresh = (s->last_cmd & CB_PD) == 0 ||
+                             ((s->last_cmd >> 4) & 7) != ch;
+                if (fresh) {
+                    s->level = ch == 5 ? SETTLE_START_X : SETTLE_START_Y;
+                }
+                s->level = v + (s->level - (int)v) * 7 / 10;
+                v = s->level;
+            }
+            s->last_cmd = tx;
             /* 16 result clocks: busy bit, then the data MSB first. */
             s->result = (tx & CB_MODE8) ? (uint16_t)((v >> 4) << 7)
                                         : (uint16_t)(v << 3);
@@ -98,15 +129,11 @@ static void tsc2046_mouse_event(void *opaque, int x, int y, int z,
 
     if (touched) {
         /* x, y arrive in 0..0x7FFF across the screen. */
-        int rx = RAW_MIN + ((RAW_MAX - RAW_MIN) * x) / 0x7FFF;
-        int ry = RAW_MIN + ((RAW_MAX - RAW_MIN) * y) / 0x7FFF;
-        /*
-         * The X51v's panel is wired with X and Y swapped (retropane-os
-         * docs/hw/touch.md): the X channel follows the screen's vertical
-         * axis. Mirror that so drivers calibrate the same as on hardware.
-         */
-        s->value[5] = ry;                   /* X channel: screen vertical */
-        s->value[1] = rx;                   /* Y channel: screen horizontal */
+        int horiz = HORIZ_LEFT + ((HORIZ_RIGHT - HORIZ_LEFT) * x) / 0x7FFF;
+        int vert = VERT_TOP + ((VERT_BOTTOM - VERT_TOP) * y) / 0x7FFF;
+        int rx = horiz;
+        s->value[5] = vert;                 /* X channel: screen vertical */
+        s->value[1] = horiz;                /* Y channel: screen horizontal */
         s->value[3] = 600;                  /* Z1 */
         s->value[4] = 600 + 6000 * 4096 / (rx * 16 + 1); /* Z2 */
     }
@@ -151,6 +178,8 @@ static const VMStateDescription vmstate_tsc2046 = {
         VMSTATE_BOOL(touched, TSC2046State),
         VMSTATE_UINT32(phase, TSC2046State),
         VMSTATE_UINT16(result, TSC2046State),
+        VMSTATE_UINT8(last_cmd, TSC2046State),
+        VMSTATE_INT32(level, TSC2046State),
         VMSTATE_END_OF_LIST()
     }
 };
