@@ -13,12 +13,14 @@
  * The mixing arithmetic is the spec's exactly, so RetroPane's tests can
  * compare screendumps against a reference bit for bit.
  *
- * The MBX core's 2D engine runs solid fills written to its command window
+ * The MBX core's 2D engine runs solid fills and copies (clipped,
+ * colour-keyed, in either direction) written to its command window
  * (see "The MBX core" below); reading an MBX offset that doesn't exist, or
  * one on the wrong block, is a bus error, as it hangs the device.
  *
  * Not modelled (the registers just read back what was written): the MBX 3D
- * core and the 2D engine's other operations, the MVED1 decoder, the hardware cursor, colour keys, gamma, the
+ * core, the 2D engine's other operations (format conversion, scaling,
+ * rotation, palettes, masks, blending), the MVED1 decoder, the hardware cursor, colour keys, gamma, the
  * video scaler (the video plane is shown 1:1) and the PLLs.
  *
  * The panel's backlight is not the 2700G's, but it decides what the screen
@@ -119,6 +121,8 @@ struct Intel2700GState {
     uint32_t mbx_state;
     int32_t mbx_skip;               /* words left to drop; -1: until the end */
     uint32_t mbx_dest, mbx_addr, mbx_colour, mbx_xy0, mbx_xy1;
+    uint32_t mbx_src, mbx_src_addr, mbx_origin, mbx_op;
+    uint32_t mbx_clip_x, mbx_clip_y, mbx_key, mbx_keymask;
 };
 
 /*
@@ -142,21 +146,9 @@ struct Intel2700GState {
 
 /* 2D command words. */
 #define CMD_DEST        0xA             /* top nibble: destination surface */
-#define CMD_FILL        0x8             /* top nibble: ROP header */
 #define CMD_END         0x70000000      /* end of batch */
-#define CMD_KEY         0x20000001      /* colour key, two words follow */
-#define FILL_NO_COLOUR  (1u << 16)      /* brush: no colour word */
+#define CMD_KEY         0x20000001      /* colour key and mask follow */
 #define ROP_PATCOPY     0xF0F0
-
-enum {
-    MBX_IDLE,       /* waiting for a command */
-    MBX_ADDR,       /* destination header seen: its address next */
-    MBX_ROP,        /* then the fill's ROP header */
-    MBX_COLOUR,
-    MBX_XY0,
-    MBX_XY1,
-    MBX_SKIP,       /* an unsupported command: drop words until CMD_END */
-};
 
 /*
  * Offsets of the MBX block that exist (the ones Dell's driver touches).
@@ -197,31 +189,127 @@ static int mbx_bpp(uint32_t dest)
     }
 }
 
-static void mbx_fill(Intel2700GState *s)
+/*
+ * The command parser. A command starts with a word whose top nibble names
+ * it; some take more words. State words (destination, source, origin,
+ * clip, key) stay set until replaced; the operation header, its colour
+ * (unless bit 16) and the destination rectangle draw.
+ */
+enum {
+    MBX_IDLE,
+    MBX_DEST_ADDR,
+    MBX_SRC_ADDR,
+    MBX_CLIP_X,
+    MBX_CLIP_Y,
+    MBX_KEY,
+    MBX_KEY_MASK,
+    MBX_COLOUR,
+    MBX_XY0,
+    MBX_XY1,
+    MBX_SKIP,       /* drop mbx_skip words; -1: until CMD_END */
+};
+
+#define OP_NO_COLOUR    (1u << 16)
+#define OP_CLIP         (1u << 18)
+#define OP_KEY          (1u << 20)
+#define OP_BOTTOM_UP    (1u << 23)
+#define OP_RIGHT_LEFT   (1u << 24)
+#define OP_ROTATE       (3u << 25)
+#define ROP_SRCCOPY     0xCCCC
+#define SCALE_1_TO_1    0x60800200
+
+static void mbx_skip(Intel2700GState *s, int words, const char *what, uint32_t w)
+{
+    if (what) {
+        qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D %s 0x%08x\n", what, w);
+    }
+    s->mbx_skip = words;
+    s->mbx_state = words ? MBX_SKIP : MBX_IDLE;
+}
+
+static uint8_t *mbx_pixel(uint8_t *vram, uint32_t surf, uint32_t addr,
+                          int x, int y)
+{
+    uint64_t at = (uint64_t)(addr & 0x03FFFFFC) + (uint64_t)y * (surf & 0x7FFF)
+                  + (uint64_t)x * mbx_bpp(surf);
+
+    if (at + mbx_bpp(surf) > INTEL_2700G_VRAM_SIZE) {
+        return NULL;
+    }
+    return vram + at;
+}
+
+static void mbx_draw(Intel2700GState *s)
 {
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t op = s->mbx_op;
     int bpp = mbx_bpp(s->mbx_dest);
-    uint64_t stride = s->mbx_dest & 0x7FFF;
-    uint64_t addr = s->mbx_addr & 0x03FFFFFC;
     int x0 = (s->mbx_xy0 >> 16) & 0x1FFF, y0 = s->mbx_xy0 & 0x1FFF;
     int x1 = (s->mbx_xy1 >> 16) & 0x1FFF, y1 = s->mbx_xy1 & 0x1FFF;
+    int cx0 = x0, cy0 = y0, cx1 = x1, cy1 = y1;
+    bool copy = (op & 0xFFFF) == ROP_SRCCOPY;
 
     if (!bpp) {
         qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: 2D destination 0x%08x:"
                       " unknown format\n", s->mbx_dest);
         return;
     }
-    for (int y = y0; y < y1; y++) {
-        for (int x = x0; x < x1; x++) {
-            uint64_t at = addr + y * stride + (uint64_t)x * bpp;
+    if ((op & 0xFFFF) != ROP_PATCOPY && !copy) {
+        qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D ROP 0x%04x\n", op & 0xFFFF);
+        return;
+    }
+    if (op & OP_ROTATE) {
+        qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D rotation 0x%08x\n", op);
+        return;
+    }
+    if (copy && mbx_bpp(s->mbx_src) != bpp) {
+        qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D copy with format conversion"
+                      " (0x%08x to 0x%08x)\n", s->mbx_src, s->mbx_dest);
+        return;
+    }
+    if (op & OP_CLIP) {                 /* right and bottom exclusive */
+        cx0 = MAX(x0, (int)(s->mbx_clip_x & 0x1FFF));
+        cx1 = MIN(x1, (int)((s->mbx_clip_x >> 16) & 0x1FFF));
+        cy0 = MAX(y0, (int)(s->mbx_clip_y & 0x1FFF));
+        cy1 = MIN(y1, (int)((s->mbx_clip_y >> 16) & 0x1FFF));
+    }
+    /*
+     * Pixel by pixel in the order the direction bits ask for, reading the
+     * source as it is at that moment: an overlapping copy in the wrong
+     * direction smears, as it would on the chip.
+     */
+    for (int j = 0; j < cy1 - cy0; j++) {
+        int y = op & OP_BOTTOM_UP ? cy1 - 1 - j : cy0 + j;
 
-            if (at + bpp > INTEL_2700G_VRAM_SIZE) {
-                qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: 2D fill past the"
-                              " end of local memory (0x%" PRIx64 ")\n", at);
+        for (int i = 0; i < cx1 - cx0; i++) {
+            int x = op & OP_RIGHT_LEFT ? cx1 - 1 - i : cx0 + i;
+            uint8_t *d = mbx_pixel(vram, s->mbx_dest, s->mbx_addr, x, y);
+            uint32_t v = s->mbx_colour;
+
+            if (copy) {
+                int sx = ((s->mbx_origin >> 14) & 0x1FFF) + (x - x0);
+                int sy = (s->mbx_origin & 0x1FFF) + (y - y0);
+                uint8_t *p = mbx_pixel(vram, s->mbx_src, s->mbx_src_addr, sx, sy);
+
+                if (!p) {
+                    d = NULL;
+                } else {
+                    v = 0;
+                    for (int k = 0; k < bpp; k++) {
+                        v |= (uint32_t)p[k] << (8 * k);
+                    }
+                    if ((op & OP_KEY) && (v & s->mbx_keymask) == s->mbx_key) {
+                        continue;       /* the key colour: left as it was */
+                    }
+                }
+            }
+            if (!d) {
+                qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: 2D access past"
+                              " the end of local memory\n");
                 return;
             }
             for (int k = 0; k < bpp; k++) {
-                vram[at + k] = s->mbx_colour >> (8 * k);
+                d[k] = v >> (8 * k);
             }
         }
     }
@@ -231,37 +319,73 @@ static void mbx_command(Intel2700GState *s, uint32_t w)
 {
     switch (s->mbx_state) {
     case MBX_IDLE:
-        if (w == CMD_END) {
+        switch (w >> 28) {
+        case 0x0:
+            if (w == 1) {
+                s->mbx_state = MBX_CLIP_X;
+            } else {
+                mbx_skip(s, -1, "command", w);
+            }
             return;
-        }
-        if (w == CMD_KEY) {
-            s->mbx_skip = 2;            /* colour key: not modelled */
-            s->mbx_state = MBX_SKIP;
+        case 0x2:
+            if (w == CMD_KEY) {
+                s->mbx_state = MBX_KEY;
+            } else {
+                mbx_skip(s, (w & 0xF) ? 1 : 0, "state", w);
+            }
             return;
-        }
-        if (w >> 28 == CMD_DEST) {
+        case 0x3:
+            s->mbx_origin = w;
+            return;
+        case 0x6:
+            if (w != SCALE_1_TO_1) {
+                qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D scaling 0x%08x\n", w);
+            }
+            return;
+        case 0x7:                       /* end of batch */
+            return;
+        case 0x8:
+            s->mbx_op = w;
+            s->mbx_state = w & OP_NO_COLOUR ? MBX_XY0 : MBX_COLOUR;
+            return;
+        case 0x9:
+            s->mbx_src = w;
+            s->mbx_state = MBX_SRC_ADDR;
+            return;
+        case CMD_DEST:
             s->mbx_dest = w;
-            s->mbx_state = MBX_ADDR;
+            s->mbx_state = MBX_DEST_ADDR;
+            return;
+        case 0xC:                       /* palettes, a mask: one address */
+        case 0xD:
+        case 0xE:
+            mbx_skip(s, 1, "palette or mask", w);
+            return;
+        default:
+            mbx_skip(s, -1, "command", w);
             return;
         }
-        qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D command 0x%08x\n", w);
-        s->mbx_skip = -1;
-        s->mbx_state = MBX_SKIP;
-        return;
-    case MBX_ADDR:
+    case MBX_DEST_ADDR:
         s->mbx_addr = w;
-        s->mbx_state = MBX_ROP;
+        break;
+    case MBX_SRC_ADDR:
+        s->mbx_src_addr = w;
+        break;
+    case MBX_CLIP_X:
+        s->mbx_clip_x = w;
+        s->mbx_state = MBX_CLIP_Y;
         return;
-    case MBX_ROP:
-        if (w >> 28 != CMD_FILL || (w & 0xFFFF) != ROP_PATCOPY ||
-            (w & FILL_NO_COLOUR)) {
-            qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D operation 0x%08x\n", w);
-            s->mbx_skip = -1;
-            s->mbx_state = MBX_SKIP;
-            return;
-        }
-        s->mbx_state = MBX_COLOUR;
+    case MBX_CLIP_Y:
+        s->mbx_clip_y = w;
+        break;
+    case MBX_KEY:
+        s->mbx_key = w;
+        s->mbx_state = MBX_KEY_MASK;
         return;
+    case MBX_KEY_MASK:
+        s->mbx_keymask = w;
+        s->mbx_key &= w;
+        break;
     case MBX_COLOUR:
         s->mbx_colour = w;
         s->mbx_state = MBX_XY0;
@@ -273,7 +397,7 @@ static void mbx_command(Intel2700GState *s, uint32_t w)
     case MBX_XY1:
         s->mbx_xy1 = w;
         s->mbx_state = MBX_IDLE;
-        mbx_fill(s);
+        mbx_draw(s);
         return;
     default:                            /* MBX_SKIP */
         if (s->mbx_skip > 0) {
@@ -285,6 +409,7 @@ static void mbx_command(Intel2700GState *s, uint32_t w)
         }
         return;
     }
+    s->mbx_state = MBX_IDLE;
 }
 
 static MemTxResult i2700g_read(void *opaque, hwaddr addr, uint64_t *data,
@@ -728,6 +853,14 @@ static const VMStateDescription vmstate_i2700g = {
         VMSTATE_UINT32(mbx_colour, Intel2700GState),
         VMSTATE_UINT32(mbx_xy0, Intel2700GState),
         VMSTATE_UINT32(mbx_xy1, Intel2700GState),
+        VMSTATE_UINT32(mbx_src, Intel2700GState),
+        VMSTATE_UINT32(mbx_src_addr, Intel2700GState),
+        VMSTATE_UINT32(mbx_origin, Intel2700GState),
+        VMSTATE_UINT32(mbx_op, Intel2700GState),
+        VMSTATE_UINT32(mbx_clip_x, Intel2700GState),
+        VMSTATE_UINT32(mbx_clip_y, Intel2700GState),
+        VMSTATE_UINT32(mbx_key, Intel2700GState),
+        VMSTATE_UINT32(mbx_keymask, Intel2700GState),
         VMSTATE_END_OF_LIST()
     },
 };
