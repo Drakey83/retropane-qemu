@@ -13,15 +13,18 @@
  * The mixing arithmetic is the spec's exactly, so RetroPane's tests can
  * compare screendumps against a reference bit for bit.
  *
- * The MBX core's 2D engine runs solid fills and copies (clipped,
- * colour-keyed, in either direction) written to its command window
- * (see "The MBX core" below); reading an MBX offset that doesn't exist, or
- * one on the wrong block, is a bus error, as it hangs the device.
+ * The MBX core's 2D engine runs solid fills, copies (clipped, colour-keyed,
+ * in either direction, converting between formats) and blends, written to
+ * its command window (see "The MBX core" below); reading an MBX offset that
+ * doesn't exist, or one on the wrong block, is a bus error, as it hangs the
+ * device. The display counts scan lines, sets its line and frame events and
+ * raises its interrupt output ("irq", GPIO85 on the X51v) as measured.
  *
  * Not modelled (the registers just read back what was written): the MBX 3D
- * core, the 2D engine's other operations (format conversion, scaling,
- * rotation, palettes, masks, blending), the MVED1 decoder, the hardware cursor, colour keys, gamma, the
- * video scaler (the video plane is shown 1:1) and the PLLs.
+ * core, the 2D engine's other operations (scaling, rotation, palettes,
+ * masks, ROPs other than copy and pattern copy), the MVED1 decoder, the
+ * hardware cursor, colour keys, gamma, the video scaler (the video plane is
+ * shown 1:1), scan-out under/overruns and the PLLs.
  *
  * The panel's backlight is not the 2700G's, but it decides what the screen
  * shows: the "backlight" GPIO input (the X51v's CPLD 0x18 bit 2) low shows
@@ -33,6 +36,8 @@
 #include "qemu/units.h"
 #include "qemu/bitops.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+#include "hw/irq.h"
 #include "qapi/error.h"
 #include "hw/sysbus.h"
 #include "hw/display/intel-2700g.h"
@@ -45,6 +50,7 @@
 #define NREGS           (0x4000 / 4)
 
 /* Registers (byte offsets in the register block). */
+#define R_MINTENABLE    0x0018
 #define R_PLLSTAT       0x0040
 #define R_VOVRCLK       0x0044
 #define R_ODFBPWR       0x0064
@@ -64,6 +70,10 @@
 #define R_VSADR         0x20C4
 #define R_DSCTRL        0x2154
 #define R_BGCOLOR       0x2174
+#define R_DINTRS        0x2178
+#define R_DINTRE        0x217C
+#define R_DVLNUM        0x2308
+#define R_DVECTRL       0x2310
 #define R_DHDET         0x2314
 #define R_DVDET         0x2318
 
@@ -117,6 +127,12 @@ struct Intel2700GState {
     uint32_t regs[NREGS];
     bool dark;      /* backlight input low; an input level, kept on reset */
 
+    /* The display's events: scan lines counted from the virtual clock. */
+    qemu_irq irq;                   /* asserted high; GPIO85 is its inverse */
+    QEMUTimer *ev_timer;
+    int64_t ev_epoch;               /* virtual ns at line 0 of frame 0 */
+    int64_t ev_line;                /* lines since then, events applied */
+
     /* The MBX core: its registers and the 2D engine's command parser. */
     uint32_t mbx[0x1000 / 4];
     uint32_t mbx_state;
@@ -124,6 +140,7 @@ struct Intel2700GState {
     uint32_t mbx_dest, mbx_addr, mbx_colour, mbx_xy0, mbx_xy1;
     uint32_t mbx_src, mbx_src_addr, mbx_origin, mbx_op;
     uint32_t mbx_clip_x, mbx_clip_y, mbx_key, mbx_keymask;
+    uint32_t mbx_blend;
 };
 
 /*
@@ -149,6 +166,7 @@ struct Intel2700GState {
 #define CMD_DEST        0xA             /* top nibble: destination surface */
 #define CMD_END         0x70000000      /* end of batch */
 #define CMD_KEY         0x20000001      /* colour key and mask follow */
+#define CMD_BLEND       0x20000004      /* the blend state word follows */
 #define ROP_PATCOPY     0xF0F0
 
 /*
@@ -174,9 +192,21 @@ static bool system_block_freezes(hwaddr addr)
            addr == MBX_ID;
 }
 
+/*
+ * 2D format codes (surface words, bits 15-19; retropane-os docs/hw/2700g.md,
+ * measured 2026-10-14 by rp-mbx-blend).
+ */
+#define MBX_FMT(surf)       (((surf) >> 15) & 0x1F)
+#define MBX_COVERAGE4       0x5         /* 4 bpp coverage, high nibble first */
+#define MBX_ARGB4444        0x7
+#define MBX_XRGB1555        0x8         /* 8 and 9: 1:5:5:5, read with alpha 0 */
+#define MBX_XRGB1555_9      0x9
+#define MBX_RGB565          0xA
+#define MBX_ARGB8888        0xC         /* 13-15 act as 12 */
+
 static int mbx_bpp(uint32_t dest)
 {
-    switch ((dest >> 15) & 0x1F) {
+    switch (MBX_FMT(dest)) {
     case 0x6:
         return 1;
     case 0xA:
@@ -204,6 +234,7 @@ enum {
     MBX_CLIP_Y,
     MBX_KEY,
     MBX_KEY_MASK,
+    MBX_BLEND_WORD,
     MBX_COLOUR,
     MBX_XY0,
     MBX_XY1,
@@ -211,6 +242,7 @@ enum {
 };
 
 #define OP_NO_COLOUR    (1u << 16)
+#define OP_BLEND        (1u << 17)      /* apply the blend state word */
 #define OP_CLIP         (1u << 18)
 #define OP_KEY          (1u << 20)
 /*
@@ -271,37 +303,173 @@ static uint8_t *mbx_pixel(uint8_t *vram, uint32_t surf, uint32_t addr,
     return vram + at;
 }
 
+/* Bits per source pixel (sources know more formats than destinations). */
+static int mbx_src_bits(uint32_t surf)
+{
+    switch (MBX_FMT(surf)) {
+    case MBX_COVERAGE4:
+        return 4;
+    case MBX_ARGB4444:
+    case MBX_XRGB1555:
+    case MBX_XRGB1555_9:
+        return 16;
+    case 0xD:
+    case 0xE:
+    case 0xF:
+        return 32;
+    default:
+        return mbx_bpp(surf) * 8;
+    }
+}
+
 /* A source pixel: local memory, or the constant past it. */
 static uint32_t mbx_read(uint8_t *vram, uint32_t surf, uint32_t addr,
                          int x, int y)
 {
-    uint32_t at = mbx_at(surf, addr, x, y);
+    int bits = mbx_src_bits(surf);
+    uint32_t at = ((addr & 0x03FFFFFC) + (uint32_t)(y * mbx_stride(surf))
+                   + (uint32_t)x * bits / 8) & MBX_DECODE;
     uint32_t v = 0;
 
-    for (int k = 0; k < mbx_bpp(surf); k++) {
+    for (int k = 0; k < MAX(bits / 8, 1); k++) {
         uint32_t b = at + k < INTEL_2700G_VRAM_SIZE ? vram[at + k]
                      : (MBX_UNMAPPED >> (8 * ((at + k) & 3))) & 0xFF;
         v |= b << (8 * k);
     }
+    if (bits == 4) {
+        v = x & 1 ? v & 0xF : v >> 4;   /* high nibble first (measured) */
+    }
     return v;
 }
+
+/*
+ * A pixel as 8-bit (a, r, g, b), channels widened by bit replication (as
+ * measured: a 5-bit 31 blends as 255). A coverage pixel takes its colour
+ * from the colour word, xRGB8888. False: a format with no known meaning.
+ */
+static bool mbx_argb(int fmt, uint32_t v, uint32_t colour, int c[4])
+{
+    switch (fmt) {
+    case MBX_COVERAGE4:
+        c[0] = v * 17;
+        c[1] = (colour >> 16) & 0xFF;
+        c[2] = (colour >> 8) & 0xFF;
+        c[3] = colour & 0xFF;
+        return true;
+    case MBX_ARGB4444:
+        for (int k = 0; k < 4; k++) {
+            c[k] = ((v >> (12 - 4 * k)) & 0xF) * 17;
+        }
+        return true;
+    case MBX_XRGB1555:
+    case MBX_XRGB1555_9:
+        c[0] = 0;
+        for (int k = 1; k < 4; k++) {
+            int f = (v >> (15 - 5 * k)) & 0x1F;
+            c[k] = f << 3 | f >> 2;
+        }
+        return true;
+    case MBX_RGB565: {
+        int r = (v >> 11) & 0x1F, g = (v >> 5) & 0x3F, b = v & 0x1F;
+
+        c[0] = 255;
+        c[1] = r << 3 | r >> 2;
+        c[2] = g << 2 | g >> 4;
+        c[3] = b << 3 | b >> 2;
+        return true;
+    }
+    case MBX_ARGB8888:
+    case 0xD:
+    case 0xE:
+    case 0xF:
+        for (int k = 0; k < 4; k++) {
+            c[k] = (v >> (24 - 8 * k)) & 0xFF;
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* (a, r, g, b) to a destination pixel, truncated to its bits (measured). */
+static bool mbx_pack(int fmt, const int c[4], uint32_t *v)
+{
+    switch (fmt) {
+    case MBX_RGB565:
+        *v = (c[1] >> 3) << 11 | (c[2] >> 2) << 5 | c[3] >> 3;
+        return true;
+    case MBX_ARGB8888:
+        *v = (uint32_t)c[0] << 24 | c[1] << 16 | c[2] << 8 | c[3];
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * The blend (header bit 17), as measured on the X51v 2026-10-14 (rp-mbx-blend
+ * B1-B3, every pixel exact): result = (s * Fs + d * Fd) >> 8 per channel,
+ * saturated at 255, then truncated to the destination's bits. The blend
+ * word's bits 27-24 pick Fd and 23-20 Fs; other bits changed nothing. Alpha
+ * is 8-bit (4-bit values times 17) and weighs a + (a >> 7) out of 256.
+ */
+enum { F_ONE, F_A, F_ZERO, F_INV_A };
+static const uint8_t mbx_factors[16] = {
+    F_ONE, F_A, F_ZERO, F_A,            /* 3: "A" from another source? */
+    F_ZERO, F_ZERO, F_ZERO, F_ZERO, F_ZERO,
+    F_INV_A, F_ONE, F_INV_A, F_ONE, F_ONE, F_ONE, F_ONE,
+};
+
+static int mbx_factor(int code, int a)
+{
+    int w = a + (a >> 7);
+
+    switch (mbx_factors[code & 0xF]) {
+    case F_ONE:
+        return 256;
+    case F_A:
+        return w;
+    case F_ZERO:
+        return 0;
+    default:
+        return 256 - w;
+    }
+}
+
+static void mbx_blend(uint32_t word, const int src[4], int dst[4])
+{
+    int fs = mbx_factor(word >> 20, src[0]);
+    int fd = mbx_factor(word >> 24, src[0]);
+
+    /* The destination's own alpha (32 bpp) is kept: not measured. */
+    for (int k = 1; k < 4; k++) {
+        dst[k] = MIN((src[k] * fs + dst[k] * fd) >> 8, 255);
+    }
+}
+
+/* How a pixel gets from the source (or colour word) to the destination. */
+enum { MBX_SOLID, MBX_RAW, MBX_CONVERT, MBX_BLEND };
 
 static void mbx_draw(Intel2700GState *s)
 {
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     uint32_t op = s->mbx_op;
-    int bpp = mbx_bpp(s->mbx_dest);
+    uint32_t dest = s->mbx_dest;
+    int bpp = mbx_bpp(dest);
     int x0 = (s->mbx_xy0 >> 16) & 0x1FFF, y0 = s->mbx_xy0 & 0x1FFF;
     int x1 = (s->mbx_xy1 >> 16) & 0x1FFF, y1 = s->mbx_xy1 & 0x1FFF;
     int cx0 = x0, cy0 = y0, cx1 = x1, cy1 = y1;
-    bool copy = (op & 0xFFFF) == ROP_SRCCOPY;
+    int sfmt = MBX_FMT(s->mbx_src), dfmt = MBX_FMT(dest);
+    int c[4], d[4];
+    uint32_t packed;
+    int how;
 
     if (!bpp) {
         qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: 2D destination 0x%08x:"
                       " unknown format\n", s->mbx_dest);
         return;
     }
-    if ((op & 0xFFFF) != ROP_PATCOPY && !copy) {
+    if ((op & 0xFFFF) != ROP_PATCOPY && (op & 0xFFFF) != ROP_SRCCOPY) {
         qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D ROP 0x%04x\n", op & 0xFFFF);
         return;
     }
@@ -309,7 +477,35 @@ static void mbx_draw(Intel2700GState *s)
         qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D rotation 0x%08x\n", op);
         return;
     }
-    if (copy && mbx_bpp(s->mbx_src) != bpp) {
+    /*
+     * With bit 17 the engine reads the source whatever the ROP (measured: a
+     * fill with it blended the last source surface, not its colour).
+     * Without it, copies convert between formats and ignore alpha, except
+     * that a coverage source writes 32-bit pixels, coverage x 17 as alpha
+     * over the colour word, whatever the destination's format (measured:
+     * the 16 bpp test row read back as eight such pixels).
+     */
+    if (op & OP_BLEND) {
+        how = MBX_BLEND;
+        if (!mbx_argb(sfmt, 0, 0, c) || !mbx_pack(dfmt, c, &packed)) {
+            qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D blend from 0x%08x to"
+                          " 0x%08x\n", s->mbx_src, dest);
+            return;
+        }
+    } else if ((op & 0xFFFF) != ROP_SRCCOPY) {
+        how = MBX_SOLID;
+    } else if (sfmt == MBX_COVERAGE4) {
+        how = MBX_CONVERT;
+        dest = (dest & ~(0x1Fu << 15)) | MBX_ARGB8888 << 15;
+        dfmt = MBX_ARGB8888;
+        bpp = 4;
+    } else if (sfmt == dfmt) {
+        how = MBX_RAW;
+    } else if (mbx_argb(sfmt, 0, 0, c) && mbx_pack(dfmt, c, &packed)) {
+        how = MBX_CONVERT;
+    } else if (mbx_src_bits(s->mbx_src) == bpp * 8) {
+        how = MBX_RAW;                  /* formats not known: copied as bits */
+    } else {
         qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D copy with format conversion"
                       " (0x%08x to 0x%08x)\n", s->mbx_src, s->mbx_dest);
         return;
@@ -331,10 +527,10 @@ static void mbx_draw(Intel2700GState *s)
 
         for (int i = 0; i < cx1 - cx0; i++) {
             int x = op & OP_RIGHT_LEFT ? cx1 - 1 - i : cx0 + i;
-            uint8_t *d = mbx_pixel(vram, s->mbx_dest, s->mbx_addr, x, y);
+            uint8_t *p = mbx_pixel(vram, dest, s->mbx_addr, x, y);
             uint32_t v = s->mbx_colour;
 
-            if (copy) {
+            if (how != MBX_SOLID) {
                 int sx = ((s->mbx_origin >> 14) & 0x1FFF) + (x - x0);
                 int sy = (s->mbx_origin & 0x1FFF) + (y - y0);
 
@@ -343,14 +539,28 @@ static void mbx_draw(Intel2700GState *s)
                     continue;       /* the key colour: left as it was */
                 }
             }
-            if (!d) {
+            if (!p) {
                 /* Writes there were never measured: dropped, logged. */
                 qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D write past the end"
                               " of local memory\n");
                 return;
             }
+            if (how == MBX_CONVERT || how == MBX_BLEND) {
+                mbx_argb(sfmt, v, s->mbx_colour, c);
+                if (how == MBX_BLEND) {
+                    uint32_t old = 0;
+
+                    for (int k = 0; k < bpp; k++) {
+                        old |= (uint32_t)p[k] << (8 * k);
+                    }
+                    mbx_argb(dfmt, old, 0, d);
+                    mbx_blend(s->mbx_blend, c, d);
+                    memcpy(c, d, sizeof(c));
+                }
+                mbx_pack(dfmt, c, &v);
+            }
             for (int k = 0; k < bpp; k++) {
-                d[k] = v >> (8 * k);
+                p[k] = v >> (8 * k);
             }
         }
     }
@@ -371,6 +581,8 @@ static void mbx_command(Intel2700GState *s, uint32_t w)
         case 0x2:
             if (w == CMD_KEY) {
                 s->mbx_state = MBX_KEY;
+            } else if (w == CMD_BLEND) {
+                s->mbx_state = MBX_BLEND_WORD;
             } else {
                 mbx_skip(s, (w & 0xF) ? 1 : 0, "state", w);
             }
@@ -427,6 +639,9 @@ static void mbx_command(Intel2700GState *s, uint32_t w)
         s->mbx_keymask = w;
         s->mbx_key &= w;
         break;
+    case MBX_BLEND_WORD:                /* kept until replaced, as on the chip */
+        s->mbx_blend = w;
+        break;
     case MBX_COLOUR:
         s->mbx_colour = w;
         s->mbx_state = MBX_XY0;
@@ -451,6 +666,97 @@ static void mbx_command(Intel2700GState *s, uint32_t w)
         return;
     }
     s->mbx_state = MBX_IDLE;
+}
+
+/*
+ * The display's events (retropane-os docs/hw/2700g.md, measured on the X51v
+ * 2026-10-14 by rp-mbx-blend): 645 lines a frame (0-644) at 27.46 us a line,
+ * 56.46 Hz. DINTRS stays a plain read/write register (a 1 written sets a
+ * bit, as on the chip); the hardware sets HBLNK0 (bit 0) as each line
+ * starts and VEVENT0 (bit 2) as the line in DVECTRL bits 16-27 starts.
+ * HBLNK1 and VEVENT1 never set; neither do the under/overrun bits here.
+ * The interrupt (GPIO85 on the X51v, low when asserted) is asserted while
+ * an event enabled in DINTRE is set and MINTENABLE bit 15 is on.
+ * Events are applied when the registers are touched or a timer, armed only
+ * for an enabled event not yet set, fires: no per-line timer otherwise.
+ */
+#define LINE_NS             27460
+#define FRAME_LINES         645
+#define EV_HBLNK0           (1u << 0)
+#define EV_VEVENT0          (1u << 2)
+#define DVECTRL_VLINE(v)    (((v) >> 16) & 0xFFF)
+#define MINT_DISPLAY        (1u << 15)
+
+static int64_t i2700g_line(Intel2700GState *s)
+{
+    return (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->ev_epoch) / LINE_NS;
+}
+
+/* The first line after `after` (lines since the epoch) that is `vline`. */
+static int64_t i2700g_next_vline(int64_t after, uint32_t vline)
+{
+    int64_t at = after - after % FRAME_LINES + vline;
+
+    if (vline >= FRAME_LINES) {
+        return -1;                      /* never reached */
+    }
+    return at > after ? at : at + FRAME_LINES;
+}
+
+static void i2700g_events(Intel2700GState *s)
+{
+    int64_t now = i2700g_line(s);
+    int64_t v = i2700g_next_vline(s->ev_line,
+                                  DVECTRL_VLINE(s->regs[R_DVECTRL / 4]));
+
+    if (now <= s->ev_line) {
+        return;
+    }
+    s->regs[R_DINTRS / 4] |= EV_HBLNK0;
+    if (v >= 0 && v <= now) {
+        s->regs[R_DINTRS / 4] |= EV_VEVENT0;
+    }
+    s->ev_line = now;
+}
+
+static void i2700g_irq_update(Intel2700GState *s)
+{
+    uint32_t status = s->regs[R_DINTRS / 4], enable = s->regs[R_DINTRE / 4];
+    bool on = s->regs[R_MINTENABLE / 4] & MINT_DISPLAY;
+    uint32_t awaited = on ? enable & ~status : 0;
+    int64_t next = -1;
+
+    qemu_set_irq(s->irq, on && (status & enable));
+    if (awaited & EV_HBLNK0) {
+        next = s->ev_line + 1;
+    }
+    if (awaited & EV_VEVENT0) {
+        int64_t v = i2700g_next_vline(s->ev_line,
+                                      DVECTRL_VLINE(s->regs[R_DVECTRL / 4]));
+
+        if (v >= 0 && (next < 0 || v < next)) {
+            next = v;
+        }
+    }
+    if (next >= 0) {
+        timer_mod(s->ev_timer, s->ev_epoch + next * LINE_NS);
+    } else {
+        timer_del(s->ev_timer);
+    }
+}
+
+static void i2700g_ev_tick(void *opaque)
+{
+    Intel2700GState *s = opaque;
+
+    i2700g_events(s);
+    i2700g_irq_update(s);
+}
+
+static bool i2700g_event_reg(hwaddr addr)
+{
+    return addr == R_DINTRS || addr == R_DINTRE || addr == R_DVECTRL ||
+           addr == R_MINTENABLE;
 }
 
 static MemTxResult i2700g_read(void *opaque, hwaddr addr, uint64_t *data,
@@ -510,6 +816,13 @@ static MemTxResult i2700g_read(void *opaque, hwaddr addr, uint64_t *data,
     case R_LMPWRSTAT:
         *data = s->regs[R_LMPWR / 4];
         break;
+    case R_DINTRS:
+        i2700g_events(s);
+        *data = s->regs[R_DINTRS / 4];
+        break;
+    case R_DVLNUM:
+        *data = i2700g_line(s) % FRAME_LINES;
+        break;
     default:
         *data = s->regs[addr / 4];
         break;
@@ -543,6 +856,12 @@ static MemTxResult i2700g_write(void *opaque, hwaddr addr, uint64_t val,
     }
     if (addr == R_ID) {
         return MEMTX_OK;                /* read-only */
+    }
+    if (i2700g_event_reg(addr)) {
+        i2700g_events(s);               /* what happened before the write */
+        s->regs[addr / 4] = val;
+        i2700g_irq_update(s);
+        return MEMTX_OK;
     }
     s->regs[addr / 4] = val;
     return MEMTX_OK;
@@ -858,6 +1177,10 @@ static void i2700g_reset(DeviceState *dev)
     memset(s->mbx, 0, sizeof(s->mbx));
     s->mbx_state = 0;
     s->mbx_skip = 0;
+    s->mbx_blend = 0;
+    s->ev_epoch = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->ev_line = 0;
+    i2700g_irq_update(s);
 }
 
 static void i2700g_realize(DeviceState *dev, Error **errp)
@@ -875,14 +1198,16 @@ static void i2700g_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->regs_mr);
     s->con = graphic_console_init(dev, 0, &i2700g_gfx_ops, s);
     qdev_init_gpio_in_named(dev, i2700g_set_backlight, "backlight", 1);
+    qdev_init_gpio_out_named(dev, &s->irq, "irq", 1);
+    s->ev_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, i2700g_ev_tick, s);
     object_property_add_bool(OBJECT(dev), "backlight", i2700g_get_backlight,
                              NULL);
 }
 
 static const VMStateDescription vmstate_i2700g = {
     .name = "intel-2700g",
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Intel2700GState, NREGS),
         VMSTATE_BOOL(dark, Intel2700GState),
@@ -902,11 +1227,18 @@ static const VMStateDescription vmstate_i2700g = {
         VMSTATE_UINT32(mbx_clip_y, Intel2700GState),
         VMSTATE_UINT32(mbx_key, Intel2700GState),
         VMSTATE_UINT32(mbx_keymask, Intel2700GState),
+        VMSTATE_UINT32(mbx_blend, Intel2700GState),
+        VMSTATE_INT64(ev_epoch, Intel2700GState),
+        VMSTATE_INT64(ev_line, Intel2700GState),
+        VMSTATE_TIMER_PTR(ev_timer, Intel2700GState),
         VMSTATE_END_OF_LIST()
     },
 };
 
-/* Present from rp-v0.12.0: tells tests the MBX 2D engine is modelled. */
+/*
+ * mbx-2d (from rp-v0.12.0): the MBX 2D engine is modelled; mbx-blend (from
+ * rp-v0.13.0): its blending and the display's events as measured.
+ */
 static bool i2700g_get_mbx_2d(Object *obj, Error **errp)
 {
     return true;
@@ -921,6 +1253,8 @@ static void i2700g_class_init(ObjectClass *klass, void *data)
     dc->vmsd = &vmstate_i2700g;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     object_class_property_add_bool(klass, "mbx-2d", i2700g_get_mbx_2d, NULL);
+    object_class_property_add_bool(klass, "mbx-blend", i2700g_get_mbx_2d,
+                                   NULL);
 }
 
 static const TypeInfo i2700g_info = {

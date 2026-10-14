@@ -47,6 +47,7 @@
 #define X51V_GPIO_CF_DETECT 13  /* CF card detect (low = card in) */
 #define X51V_GPIO_CF_READY  84  /* CF slot powered (high) */
 #define X51V_GPIO_HP_DETECT 83  /* headphone jack (assumed high = plugged) */
+#define X51V_GPIO_2700G_IRQ 85  /* 2700G interrupt (low = asserted, likely) */
 #define X51V_WM8750_ADDR    0x1a /* codec on the I2C bus (CSB unknown: 0x1a or 0x1b) */
 
 /* SDRAM on SDCS2 (docs/hw in retropane-os). */
@@ -207,6 +208,11 @@ static void x51v_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(cpld), &error_fatal);
     qdev_connect_gpio_out_named(cpld, "backlight", 0,
                                 qdev_get_gpio_in_named(gpu, "backlight", 0));
+    /* The 2700G's interrupt reaches the PXA on GPIO85 (Windows Mobile's
+     * OAL map; measured 2026-10-14: an enabled display event edges it). */
+    qdev_connect_gpio_out_named(gpu, "irq", 0,
+                                qemu_irq_invert(qdev_get_gpio_in(mpu->gpio,
+                                                X51V_GPIO_2700G_IRQ)));
     sysbus_mmio_map(SYS_BUS_DEVICE(cpld), 0, X51V_CS4_CPLD);
 
     /*
