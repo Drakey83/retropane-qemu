@@ -212,6 +212,13 @@ enum {
 #define OP_NO_COLOUR    (1u << 16)
 #define OP_CLIP         (1u << 18)
 #define OP_KEY          (1u << 20)
+/*
+ * Bit 23 is Dell's driver's "y not positive", but on the X51v it does not
+ * make a copy walk bottom-up (retropane-os docs/hw/2700g.md, measured
+ * 2026-10-14: an 8 px downward overlap smears exactly as a top-down copy),
+ * and the driver never sends it with a real overlap. Rows always run top
+ * down here; the bit is accepted and has no effect.
+ */
 #define OP_BOTTOM_UP    (1u << 23)
 #define OP_RIGHT_LEFT   (1u << 24)
 #define OP_ROTATE       (3u << 25)
@@ -227,16 +234,44 @@ static void mbx_skip(Intel2700GState *s, int words, const char *what, uint32_t w
     s->mbx_state = words ? MBX_SKIP : MBX_IDLE;
 }
 
+/*
+ * The engine decodes 32 MiB of addresses, wrapping (measured 2026-10-14):
+ * local memory at 0-16 MiB, then 16 MiB that read as this constant in
+ * every word; 32 MiB mirrors 0. No address reaches system RAM.
+ */
+#define MBX_DECODE      0x01FFFFFFu
+#define MBX_UNMAPPED    0x1000008Cu
+
+static uint32_t mbx_at(uint32_t surf, uint32_t addr, int x, int y)
+{
+    return ((addr & 0x03FFFFFC) + (uint32_t)y * (surf & 0x7FFF)
+            + (uint32_t)x * mbx_bpp(surf)) & MBX_DECODE;
+}
+
 static uint8_t *mbx_pixel(uint8_t *vram, uint32_t surf, uint32_t addr,
                           int x, int y)
 {
-    uint64_t at = (uint64_t)(addr & 0x03FFFFFC) + (uint64_t)y * (surf & 0x7FFF)
-                  + (uint64_t)x * mbx_bpp(surf);
+    uint32_t at = mbx_at(surf, addr, x, y);
 
     if (at + mbx_bpp(surf) > INTEL_2700G_VRAM_SIZE) {
         return NULL;
     }
     return vram + at;
+}
+
+/* A source pixel: local memory, or the constant past it. */
+static uint32_t mbx_read(uint8_t *vram, uint32_t surf, uint32_t addr,
+                         int x, int y)
+{
+    uint32_t at = mbx_at(surf, addr, x, y);
+    uint32_t v = 0;
+
+    for (int k = 0; k < mbx_bpp(surf); k++) {
+        uint32_t b = at + k < INTEL_2700G_VRAM_SIZE ? vram[at + k]
+                     : (MBX_UNMAPPED >> (8 * ((at + k) & 3))) & 0xFF;
+        v |= b << (8 * k);
+    }
+    return v;
 }
 
 static void mbx_draw(Intel2700GState *s)
@@ -274,12 +309,13 @@ static void mbx_draw(Intel2700GState *s)
         cy1 = MIN(y1, (int)((s->mbx_clip_y >> 16) & 0x1FFF));
     }
     /*
-     * Pixel by pixel in the order the direction bits ask for, reading the
-     * source as it is at that moment: an overlapping copy in the wrong
-     * direction smears, as it would on the chip.
+     * Pixel by pixel, rows top down (OP_BOTTOM_UP has no effect, as on
+     * the chip), right to left with OP_RIGHT_LEFT, reading the source as
+     * it is at that moment: an overlapping copy in the wrong direction
+     * smears, as it does on the chip.
      */
     for (int j = 0; j < cy1 - cy0; j++) {
-        int y = op & OP_BOTTOM_UP ? cy1 - 1 - j : cy0 + j;
+        int y = cy0 + j;
 
         for (int i = 0; i < cx1 - cx0; i++) {
             int x = op & OP_RIGHT_LEFT ? cx1 - 1 - i : cx0 + i;
@@ -289,23 +325,16 @@ static void mbx_draw(Intel2700GState *s)
             if (copy) {
                 int sx = ((s->mbx_origin >> 14) & 0x1FFF) + (x - x0);
                 int sy = (s->mbx_origin & 0x1FFF) + (y - y0);
-                uint8_t *p = mbx_pixel(vram, s->mbx_src, s->mbx_src_addr, sx, sy);
 
-                if (!p) {
-                    d = NULL;
-                } else {
-                    v = 0;
-                    for (int k = 0; k < bpp; k++) {
-                        v |= (uint32_t)p[k] << (8 * k);
-                    }
-                    if ((op & OP_KEY) && (v & s->mbx_keymask) == s->mbx_key) {
-                        continue;       /* the key colour: left as it was */
-                    }
+                v = mbx_read(vram, s->mbx_src, s->mbx_src_addr, sx, sy);
+                if ((op & OP_KEY) && (v & s->mbx_keymask) == s->mbx_key) {
+                    continue;       /* the key colour: left as it was */
                 }
             }
             if (!d) {
-                qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: 2D access past"
-                              " the end of local memory\n");
+                /* Writes there were never measured: dropped, logged. */
+                qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D write past the end"
+                              " of local memory\n");
                 return;
             }
             for (int k = 0; k < bpp; k++) {
