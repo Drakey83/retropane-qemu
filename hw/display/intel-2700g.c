@@ -31,6 +31,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "hw/sysbus.h"
@@ -242,9 +243,20 @@ static void mbx_skip(Intel2700GState *s, int words, const char *what, uint32_t w
 #define MBX_DECODE      0x01FFFFFFu
 #define MBX_UNMAPPED    0x1000008Cu
 
+/*
+ * The stride is 15-bit two's complement: a negative one walks up through
+ * memory, which is how a copy down over itself runs bottom first in one
+ * command (measured 2026-10-14: exact at shifts 1 and 8; strides
+ * 0x7F80 = -128 and 0x7C40 = -960).
+ */
+static int32_t mbx_stride(uint32_t surf)
+{
+    return sextract32(surf, 0, 15);
+}
+
 static uint32_t mbx_at(uint32_t surf, uint32_t addr, int x, int y)
 {
-    return ((addr & 0x03FFFFFC) + (uint32_t)y * (surf & 0x7FFF)
+    return ((addr & 0x03FFFFFC) + (uint32_t)(y * mbx_stride(surf))
             + (uint32_t)x * mbx_bpp(surf)) & MBX_DECODE;
 }
 
