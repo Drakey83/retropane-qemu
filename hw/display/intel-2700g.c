@@ -13,8 +13,12 @@
  * The mixing arithmetic is the spec's exactly, so RetroPane's tests can
  * compare screendumps against a reference bit for bit.
  *
+ * The MBX core's 2D engine runs solid fills written to its command window
+ * (see "The MBX core" below); reading an MBX offset that doesn't exist, or
+ * one on the wrong block, is a bus error, as it hangs the device.
+ *
  * Not modelled (the registers just read back what was written): the MBX 3D
- * core, the MVED1 decoder, the hardware cursor, colour keys, gamma, the
+ * core and the 2D engine's other operations, the MVED1 decoder, the hardware cursor, colour keys, gamma, the
  * video scaler (the video plane is shown 1:1) and the PLLs.
  *
  * The panel's backlight is not the 2700G's, but it decides what the screen
@@ -109,47 +113,278 @@ struct Intel2700GState {
     QemuConsole *con;
     uint32_t regs[NREGS];
     bool dark;      /* backlight input low; an input level, kept on reset */
+
+    /* The MBX core: its registers and the 2D engine's command parser. */
+    uint32_t mbx[0x1000 / 4];
+    uint32_t mbx_state;
+    int32_t mbx_skip;               /* words left to drop; -1: until the end */
+    uint32_t mbx_dest, mbx_addr, mbx_colour, mbx_xy0, mbx_xy1;
 };
 
-static uint64_t i2700g_read(void *opaque, hwaddr addr, unsigned size)
+/*
+ * The MBX core (retropane-os docs/hw/2700g.md, "The MBX 2D engine"):
+ * its register block at +0x4000 and the 2D engine's command window at
+ * +0x15000. Commands run the moment their last word arrives, so the FIFO
+ * always reads empty and a fence is written at once.
+ */
+#define MBX_BASE        0x4000
+#define MBX_SIZE        0x1000
+#define MBX_RESET       0x080
+#define MBX_STATUS      0x12C
+#define MBX_ENABLE      0x130
+#define MBX_CLEAR       0x134
+#define MBX_ID          0xF00
+#define MBX_REV         0xF10
+#define MBX_ID_VALUE    0x01020000      /* measured on the X51v */
+#define MBX_REV_VALUE   0x00010000
+#define MBX_2D_PORT     0x15000
+#define MBX_2D_SIZE     0x1000
+
+/* 2D command words. */
+#define CMD_DEST        0xA             /* top nibble: destination surface */
+#define CMD_FILL        0x8             /* top nibble: ROP header */
+#define CMD_END         0x70000000      /* end of batch */
+#define CMD_KEY         0x20000001      /* colour key, two words follow */
+#define FILL_NO_COLOUR  (1u << 16)      /* brush: no colour word */
+#define ROP_PATCOPY     0xF0F0
+
+enum {
+    MBX_IDLE,       /* waiting for a command */
+    MBX_ADDR,       /* destination header seen: its address next */
+    MBX_ROP,        /* then the fill's ROP header */
+    MBX_COLOUR,
+    MBX_XY0,
+    MBX_XY1,
+    MBX_SKIP,       /* an unsupported command: drop words until CMD_END */
+};
+
+/*
+ * Offsets of the MBX block that exist (the ones Dell's driver touches).
+ * Reading any other one is a bus error here; on the device unimplemented
+ * addresses in the 2700G's register block hang the bus.
+ */
+static bool mbx_known(hwaddr off)
+{
+    return off == MBX_RESET || off == MBX_STATUS || off == MBX_ENABLE ||
+           off == MBX_CLEAR || (off >= 0x300 && off <= 0x30C) ||
+           (off >= 0x600 && off <= 0x6FC) || (off >= 0x800 && off <= 0x85C) ||
+           off == MBX_ID || off == MBX_REV || off >= 0xFE0;
+}
+
+/*
+ * Offsets of the MBX block that froze Windows Mobile when read on the
+ * system block (rp-wmgpu v3-v6): a wrong base is caught, not read as 0.
+ */
+static bool system_block_freezes(hwaddr addr)
+{
+    return addr == MBX_STATUS || addr == 0x30C || addr == 0x85C ||
+           addr == MBX_ID;
+}
+
+static int mbx_bpp(uint32_t dest)
+{
+    switch ((dest >> 15) & 0x1F) {
+    case 0x6:
+        return 1;
+    case 0xA:
+        return 2;                       /* RGB565 */
+    case 0xB:
+        return 3;
+    case 0xC:
+        return 4;
+    default:
+        return 0;
+    }
+}
+
+static void mbx_fill(Intel2700GState *s)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    int bpp = mbx_bpp(s->mbx_dest);
+    uint64_t stride = s->mbx_dest & 0x7FFF;
+    uint64_t addr = s->mbx_addr & 0x03FFFFFC;
+    int x0 = (s->mbx_xy0 >> 16) & 0x1FFF, y0 = s->mbx_xy0 & 0x1FFF;
+    int x1 = (s->mbx_xy1 >> 16) & 0x1FFF, y1 = s->mbx_xy1 & 0x1FFF;
+
+    if (!bpp) {
+        qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: 2D destination 0x%08x:"
+                      " unknown format\n", s->mbx_dest);
+        return;
+    }
+    for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++) {
+            uint64_t at = addr + y * stride + (uint64_t)x * bpp;
+
+            if (at + bpp > INTEL_2700G_VRAM_SIZE) {
+                qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: 2D fill past the"
+                              " end of local memory (0x%" PRIx64 ")\n", at);
+                return;
+            }
+            for (int k = 0; k < bpp; k++) {
+                vram[at + k] = s->mbx_colour >> (8 * k);
+            }
+        }
+    }
+}
+
+static void mbx_command(Intel2700GState *s, uint32_t w)
+{
+    switch (s->mbx_state) {
+    case MBX_IDLE:
+        if (w == CMD_END) {
+            return;
+        }
+        if (w == CMD_KEY) {
+            s->mbx_skip = 2;            /* colour key: not modelled */
+            s->mbx_state = MBX_SKIP;
+            return;
+        }
+        if (w >> 28 == CMD_DEST) {
+            s->mbx_dest = w;
+            s->mbx_state = MBX_ADDR;
+            return;
+        }
+        qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D command 0x%08x\n", w);
+        s->mbx_skip = -1;
+        s->mbx_state = MBX_SKIP;
+        return;
+    case MBX_ADDR:
+        s->mbx_addr = w;
+        s->mbx_state = MBX_ROP;
+        return;
+    case MBX_ROP:
+        if (w >> 28 != CMD_FILL || (w & 0xFFFF) != ROP_PATCOPY ||
+            (w & FILL_NO_COLOUR)) {
+            qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D operation 0x%08x\n", w);
+            s->mbx_skip = -1;
+            s->mbx_state = MBX_SKIP;
+            return;
+        }
+        s->mbx_state = MBX_COLOUR;
+        return;
+    case MBX_COLOUR:
+        s->mbx_colour = w;
+        s->mbx_state = MBX_XY0;
+        return;
+    case MBX_XY0:
+        s->mbx_xy0 = w;
+        s->mbx_state = MBX_XY1;
+        return;
+    case MBX_XY1:
+        s->mbx_xy1 = w;
+        s->mbx_state = MBX_IDLE;
+        mbx_fill(s);
+        return;
+    default:                            /* MBX_SKIP */
+        if (s->mbx_skip > 0) {
+            if (--s->mbx_skip == 0) {
+                s->mbx_state = MBX_IDLE;
+            }
+        } else if (w == CMD_END) {
+            s->mbx_state = MBX_IDLE;
+        }
+        return;
+    }
+}
+
+static MemTxResult i2700g_read(void *opaque, hwaddr addr, uint64_t *data,
+                               unsigned size, MemTxAttrs attrs)
 {
     Intel2700GState *s = opaque;
 
+    if (addr >= MBX_BASE && addr < MBX_BASE + MBX_SIZE) {
+        hwaddr off = addr - MBX_BASE;
+
+        if (!mbx_known(off)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: read of MBX 0x%03"
+                          HWADDR_PRIx " (not implemented: the device's bus"
+                          " hangs)\n", off);
+            return MEMTX_ERROR;
+        }
+        switch (off) {
+        case MBX_ID:
+            *data = MBX_ID_VALUE;
+            break;
+        case MBX_REV:
+            *data = MBX_REV_VALUE;
+            break;
+        case MBX_STATUS:                /* FIFO level 0: commands run at once */
+            *data = s->mbx[off / 4] & ~0x40FF0000u;
+            break;
+        default:
+            *data = off >= 0xFE0 ? 0 : s->mbx[off / 4];
+            break;
+        }
+        return MEMTX_OK;
+    }
+    if (addr >= MBX_2D_PORT && addr < MBX_2D_PORT + MBX_2D_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: read of the 2D command"
+                      " window (write-only)\n");
+        return MEMTX_ERROR;
+    }
+    if (system_block_freezes(addr)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: read of 0x%03" HWADDR_PRIx
+                      ": an MBX offset on the system block (froze the"
+                      " device)\n", addr);
+        return MEMTX_ERROR;
+    }
     if (addr >= sizeof(s->regs)) {
         qemu_log_mask(LOG_UNIMP, "intel-2700g: read of 0x%05" HWADDR_PRIx
                       " (outside modelled registers)\n", addr);
-        return 0;
+        *data = 0;
+        return MEMTX_OK;
     }
     switch (addr) {
     case R_PLLSTAT:
-        return 0xFFFFFFFF;                  /* every PLL reports locked */
+        *data = 0xFFFFFFFF;             /* every PLL reports locked */
+        break;
     case R_ODFBSTAT:
-        return s->regs[R_ODFBPWR / 4];      /* power state follows request */
+        *data = s->regs[R_ODFBPWR / 4]; /* power state follows request */
+        break;
     case R_LMPWRSTAT:
-        return s->regs[R_LMPWR / 4];
+        *data = s->regs[R_LMPWR / 4];
+        break;
     default:
-        return s->regs[addr / 4];
+        *data = s->regs[addr / 4];
+        break;
     }
+    return MEMTX_OK;
 }
 
-static void i2700g_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+static MemTxResult i2700g_write(void *opaque, hwaddr addr, uint64_t val,
+                                unsigned size, MemTxAttrs attrs)
 {
     Intel2700GState *s = opaque;
 
+    if (addr >= MBX_BASE && addr < MBX_BASE + MBX_SIZE) {
+        hwaddr off = addr - MBX_BASE;
+
+        if (off == MBX_CLEAR) {
+            s->mbx[MBX_STATUS / 4] &= ~(uint32_t)val;
+        } else if (off != MBX_ID && off != MBX_REV && off != MBX_STATUS) {
+            s->mbx[off / 4] = val;
+        }
+        return MEMTX_OK;
+    }
+    if (addr >= MBX_2D_PORT && addr < MBX_2D_PORT + MBX_2D_SIZE) {
+        mbx_command(s, val);            /* any offset: the window is a FIFO */
+        return MEMTX_OK;
+    }
     if (addr >= sizeof(s->regs)) {
         qemu_log_mask(LOG_UNIMP, "intel-2700g: write 0x%08" PRIx64 " to 0x%05"
                       HWADDR_PRIx " (outside modelled registers)\n", val, addr);
-        return;
+        return MEMTX_OK;
     }
     if (addr == R_ID) {
-        return;                             /* read-only */
+        return MEMTX_OK;                /* read-only */
     }
     s->regs[addr / 4] = val;
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps i2700g_ops = {
-    .read = i2700g_read,
-    .write = i2700g_write,
+    .read_with_attrs = i2700g_read,
+    .write_with_attrs = i2700g_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
@@ -454,6 +689,9 @@ static void i2700g_reset(DeviceState *dev)
     Intel2700GState *s = INTEL_2700G(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    memset(s->mbx, 0, sizeof(s->mbx));
+    s->mbx_state = 0;
+    s->mbx_skip = 0;
 }
 
 static void i2700g_realize(DeviceState *dev, Error **errp)
@@ -477,14 +715,28 @@ static void i2700g_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_i2700g = {
     .name = "intel-2700g",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Intel2700GState, NREGS),
         VMSTATE_BOOL(dark, Intel2700GState),
+        VMSTATE_UINT32_ARRAY(mbx, Intel2700GState, 0x1000 / 4),
+        VMSTATE_UINT32(mbx_state, Intel2700GState),
+        VMSTATE_INT32(mbx_skip, Intel2700GState),
+        VMSTATE_UINT32(mbx_dest, Intel2700GState),
+        VMSTATE_UINT32(mbx_addr, Intel2700GState),
+        VMSTATE_UINT32(mbx_colour, Intel2700GState),
+        VMSTATE_UINT32(mbx_xy0, Intel2700GState),
+        VMSTATE_UINT32(mbx_xy1, Intel2700GState),
         VMSTATE_END_OF_LIST()
     },
 };
+
+/* Present from rp-v0.12.0: tells tests the MBX 2D engine is modelled. */
+static bool i2700g_get_mbx_2d(Object *obj, Error **errp)
+{
+    return true;
+}
 
 static void i2700g_class_init(ObjectClass *klass, void *data)
 {
@@ -494,6 +746,7 @@ static void i2700g_class_init(ObjectClass *klass, void *data)
     dc->reset = i2700g_reset;
     dc->vmsd = &vmstate_i2700g;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+    object_class_property_add_bool(klass, "mbx-2d", i2700g_get_mbx_2d, NULL);
 }
 
 static const TypeInfo i2700g_info = {
