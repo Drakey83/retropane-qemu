@@ -67,6 +67,30 @@ static int pxa2xx_timer4_freq[8] = {
     [5 ... 7] = 0,
 };
 
+/*
+ * OS timer channels that don't count on a real PXA270, as measured on the
+ * Dell Axim X51v (retropane-os rp-noise run 3, 2026-10-15, docs/hw/
+ * entropy.md): channel 5 counts the 32.768 kHz clock only with OMCR5 bit 6
+ * set (0xC1 counted; 0x81, 0x01, 0x82 and 0x84 never did, whichever of
+ * OSCR5/OMCR5 was written first), and channels 6 and 8 don't count with
+ * 0x81 (runs 3 and 4). The rule behind it isn't understood, so only what
+ * was found is modelled: channel 5 without bit 6, and 0x81 on channels 6
+ * and 8. Channel 11 with 0x81 counted in run 3 and not in run 4, so it is
+ * left counting; untested channels and values count as before.
+ */
+static bool pxa27x_timer4_stopped(int tm, uint32_t control)
+{
+    switch (tm + 4) {
+    case 5:
+        return !(control & (1 << 6));
+    case 6:
+    case 8:
+        return control == 0x81;
+    default:
+        return false;
+    }
+}
+
 #define TYPE_PXA2XX_TIMER "pxa2xx-timer"
 OBJECT_DECLARE_SIMPLE_TYPE(PXA2xxTimerInfo, PXA2XX_TIMER)
 
@@ -361,7 +385,10 @@ static void pxa2xx_timer_write(void *opaque, hwaddr offset,
             goto badreg;
         s->tm4[tm].control = value & 0x0ff;
         /* XXX Stop if running (shouldn't happen) */
-        if ((value & (1 << 7)) || tm == 0)
+        if (pxa27x_timer4_stopped(tm, s->tm4[tm].control)) {
+            s->tm4[tm].freq = 0;
+            pxa2xx_timer_update4(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), tm);
+        } else if ((value & (1 << 7)) || tm == 0)
             s->tm4[tm].freq = pxa2xx_timer4_freq[value & 7];
         else {
             s->tm4[tm].freq = 0;
@@ -379,7 +406,10 @@ static void pxa2xx_timer_write(void *opaque, hwaddr offset,
             goto badreg;
         s->tm4[tm].control = value & 0x3ff;
         /* XXX Stop if running (shouldn't happen) */
-        if ((value & (1 << 7)) || !(tm & 1))
+        if (pxa27x_timer4_stopped(tm, s->tm4[tm].control)) {
+            s->tm4[tm].freq = 0;
+            pxa2xx_timer_update4(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), tm);
+        } else if ((value & (1 << 7)) || !(tm & 1))
             s->tm4[tm].freq =
                     pxa2xx_timer4_freq[(value & (1 << 8)) ?  0 : (value & 7)];
         else {
