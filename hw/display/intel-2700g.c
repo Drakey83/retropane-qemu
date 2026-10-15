@@ -19,9 +19,11 @@
  * doesn't exist, or one on the wrong block, is a bus error, as it hangs the
  * device. The display counts scan lines, sets its line and frame events and
  * raises its interrupt output ("irq", GPIO85 on the X51v) as measured.
+ * The MBX 3D core renders its direct path (objects, lists and region
+ * arrays the CPU writes) as measured (see "The MBX 3D core" below).
  *
  * Not modelled (the registers just read back what was written): the MBX 3D
- * core, the 2D engine's other operations (scaling, rotation, palettes,
+ * core's tile accelerator, the 2D engine's other operations (scaling, rotation, palettes,
  * masks, ROPs other than copy and pattern copy), the MVED1 decoder, the
  * hardware cursor, colour keys, gamma, the video scaler (the video plane is
  * shown 1:1), scan-out under/overruns and the PLLs.
@@ -45,6 +47,7 @@
 #include "ui/pixel_ops.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
+#include <math.h>
 
 #define REG_WINDOW      0x20000
 #define NREGS           (0x4000 / 4)
@@ -141,6 +144,12 @@ struct Intel2700GState {
     uint32_t mbx_src, mbx_src_addr, mbx_origin, mbx_op;
     uint32_t mbx_clip_x, mbx_clip_y, mbx_key, mbx_keymask;
     uint32_t mbx_blend;
+
+    /* The 3D core (see "The MBX 3D core" below). */
+    int64_t m3_done_ns;             /* render done due; INT64_MIN: none */
+    int64_t m3_ready_ns;            /* memory manager ready due */
+    bool m3_pm_set;                 /* the memory manager was started */
+    bool m3_hung;                   /* until a reset */
 };
 
 /*
@@ -753,6 +762,475 @@ static void i2700g_ev_tick(void *opaque)
     i2700g_irq_update(s);
 }
 
+/*
+ * The MBX 3D core's direct path (retropane-os ADR-0024/ADR-0026,
+ * docs/hw/2700g.md "The scene bytes"), as measured on the X51v by rp-mbx3d
+ * versions 3-23 and rp-mbx3d-api runs 1-3. A port of rp-mbx3d-render's
+ * host model (drivers/mbx3d-render/src/model.rs): the two must agree, so a
+ * change here goes there too.
+ *
+ * Writing 1 to 0x680 renders the region array at 0x608: two words a tile
+ * (x | y << 8, bit 31 on the last; the tile's object list), each 8 x 16
+ * tile written whole into the target at 0x65C (stride 0x660 words),
+ * uncovered pixels white, unlisted tiles untouched. Lists hold strip
+ * pointers (0x40800000 flat 17-word objects, 0x41000000 textured 26-word
+ * ones, offsets in words from 0x60C) up to an 0xF... end word. Flat shading
+ * takes the first vertex's colour, TSP bit 22 Gouraud; textures are
+ * twiddled, point sampled, TEX0 bits 15-13 the format, 27-24/23-20 the
+ * sides, 31-28 the address modes (wrap, mirror, clamp); TSP bit 13 blends
+ * with the factors in bits 31-26 (each term value x factor >> 8, alpha
+ * factors a and 256 - a); TSP bits 11-9 compare depth (larger z nearer;
+ * "greater", "greater or equal", "always"), bit 7 set = no write; each
+ * tile's depth starts at 0x6DC as a float if its bit 0 is set, else
+ * undefined (no compare passes but "always"). Render done (status bit 2)
+ * comes ~10 us + 5.25 us a tile + a quad's cost a tile later (fitted to
+ * run 2); the parameter memory manager says ready (bit 6) 164 us after
+ * 0x838 = 1, only with the 3D clock on (MBXCLK bits 1-0 = 2); without both
+ * a start does nothing. TSP bits 16 and 19 hang the core until a reset.
+ *
+ * Assumed (not measured): pixel centres at +0.5 with a top-left fill rule,
+ * Gouraud and modulate rounding, both windings drawn, 0x654/0x658 not
+ * clipping. The core keeps its state across the 3D clock off (T9, measured:
+ * rp-mbx3d-api run 4).
+ * "Less" and "less or equal" never passed on the device (and hid objects
+ * in partial renders, not modelled): here they never pass. Not modelled:
+ * the tile accelerator, the interrupt line (render done never edged
+ * GPIO85), filtering, depth across renders (0x674).
+ */
+#define R_MBXCLK            0x0054
+#define M3_START            0x680
+#define M3_PM_GO            0x838
+#define M3_RENDER_DONE      (1u << 2)
+#define M3_PM_READY         (1u << 6)
+#define M3_LAST             (1u << 31)
+#define M3_ADDR_MASK        0x01FFFFFCu
+#define M3_STRIP_FLAT       0x40800000u
+#define M3_STRIP_TEX        0x41000000u
+#define M3_TSP_GOURAUD      (1u << 22)
+#define M3_TSP_BLEND        (1u << 13)
+#define M3_TSP_NO_WRITE     (1u << 7)
+#define M3_TSP_HANGS        ((1u << 16) | (1u << 19))
+#define M3_TILE_W           8
+#define M3_TILE_H           16
+#define M3_NONE             INT64_MIN
+
+typedef struct M3Vertex {
+    double x, y, z, u, v;
+    uint32_t argb;
+} M3Vertex;
+
+typedef struct M3Obj {
+    uint32_t tsp;
+    bool textured;
+    uint32_t tex[3];
+    M3Vertex v[3];
+} M3Obj;
+
+typedef struct M3Tile {
+    uint32_t x, y;
+    uint32_t c[M3_TILE_W * M3_TILE_H];
+    double z[M3_TILE_W * M3_TILE_H];
+} M3Tile;
+
+static uint32_t m3_word(Intel2700GState *s, uint32_t a)
+{
+    a &= M3_ADDR_MASK;
+    if (a + 4 > INTEL_2700G_VRAM_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: 3D read past local"
+                      " memory at 0x%08x\n", a);
+        return 0;
+    }
+    return ldl_le_p((uint8_t *)memory_region_get_ram_ptr(&s->vram) + a);
+}
+
+static double m3_float(uint32_t w)
+{
+    float f;
+
+    memcpy(&f, &w, sizeof(f));
+    return f;
+}
+
+static void m3_object(Intel2700GState *s, uint32_t at, bool textured,
+                      M3Obj *o)
+{
+    int k;
+
+    o->textured = textured;
+    if (textured) {
+        o->tsp = m3_word(s, at + 4 * 4);
+        for (k = 0; k < 3; k++) {
+            o->tex[k] = m3_word(s, at + 4 * (1 + k));
+            o->v[k].x = m3_float(m3_word(s, at + 4 * (5 + 2 * k)));
+            o->v[k].y = m3_float(m3_word(s, at + 4 * (6 + 2 * k)));
+            o->v[k].z = m3_float(m3_word(s, at + 4 * (11 + k)));
+            o->v[k].argb = m3_word(s, at + 4 * (17 + 3 * k));
+            o->v[k].u = m3_float(m3_word(s, at + 4 * (18 + 3 * k)));
+            o->v[k].v = m3_float(m3_word(s, at + 4 * (19 + 3 * k)));
+        }
+    } else {
+        o->tsp = m3_word(s, at + 4);
+        for (k = 0; k < 3; k++) {
+            o->v[k].x = m3_float(m3_word(s, at + 4 * (2 + 2 * k)));
+            o->v[k].y = m3_float(m3_word(s, at + 4 * (3 + 2 * k)));
+            o->v[k].z = m3_float(m3_word(s, at + 4 * (8 + k)));
+            o->v[k].argb = m3_word(s, at + 4 * (14 + k));
+            o->v[k].u = o->v[k].v = 0;
+        }
+    }
+}
+
+static uint32_t m3_twiddle(uint32_t x, uint32_t y)
+{
+    uint32_t r = 0;
+    int b;
+
+    for (b = 0; b < 16; b++) {
+        r |= ((y >> b) & 1) << (2 * b) | ((x >> b) & 1) << (2 * b + 1);
+    }
+    return r;
+}
+
+static int64_t m3_address(double c, int64_t side, uint32_t mode)
+{
+    int64_t i = (int64_t)floor(c * side), p;
+
+    switch (mode) {
+    case 0:                             /* wrap */
+        return ((i % side) + side) % side;
+    case 1:                             /* mirror */
+        p = ((i % (2 * side)) + 2 * side) % (2 * side);
+        return p >= side ? 2 * side - 1 - p : p;
+    case 2:                             /* clamp */
+        return i < 0 ? 0 : i > side - 1 ? side - 1 : i;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: texture address mode 3"
+                      " (broke sampling on the device)\n");
+        return 0;
+    }
+}
+
+static uint32_t m3_wide(uint32_t c, int bits)
+{
+    switch (bits) {
+    case 5:
+        return c << 3 | c >> 2;
+    case 6:
+        return c << 2 | c >> 4;
+    case 4:
+        return c * 17;
+    case 3:
+        return c << 5 | c << 2 | c >> 1;
+    default:                            /* 2 */
+        return c * 85;
+    }
+}
+
+static uint32_t m3_argb(uint32_t a, uint32_t r, uint32_t g, uint32_t b)
+{
+    return a << 24 | r << 16 | g << 8 | b;
+}
+
+static uint32_t m3_sample(Intel2700GState *s, const uint32_t tex[3],
+                          double u, double v)
+{
+    uint32_t tex0 = tex[0];
+    int64_t su = 8ll << ((tex0 >> 24) & 15), sv = 8ll << ((tex0 >> 20) & 15);
+    uint32_t x = m3_address(u, su, tex0 >> 30);
+    uint32_t y = m3_address(v, sv, (tex0 >> 28) & 3);
+    uint32_t a = ((tex[1] & 0x01FFFFFF) << 7) + 2 * m3_twiddle(x, y);
+    uint32_t t = m3_word(s, a & ~3u) >> (8 * (a & 2)) & 0xFFFF;
+
+    switch ((tex0 >> 13) & 7) {
+    case 0:                             /* ARGB1555 */
+        return m3_argb(t & 0x8000 ? 255 : 0, m3_wide((t >> 10) & 31, 5),
+                       m3_wide((t >> 5) & 31, 5), m3_wide(t & 31, 5));
+    case 2:                             /* RGB565 */
+        return m3_argb(255, m3_wide(t >> 11, 5), m3_wide((t >> 5) & 63, 6),
+                       m3_wide(t & 31, 5));
+    case 4:                             /* ARGB4444 */
+        return m3_argb(m3_wide(t >> 12, 4), m3_wide((t >> 8) & 15, 4),
+                       m3_wide((t >> 4) & 15, 4), m3_wide(t & 15, 4));
+    case 6:                             /* RGB332 in the low byte */
+        return m3_argb(255, m3_wide((t >> 5) & 7, 3),
+                       m3_wide((t >> 2) & 7, 3), m3_wide(t & 3, 2));
+    default:
+        qemu_log_mask(LOG_UNIMP, "intel-2700g: texel format %u not decoded"
+                      " on the device\n", (tex0 >> 13) & 7);
+        return 0xFF000000;
+    }
+}
+
+static uint32_t m3_modulate(uint32_t t, uint32_t c)
+{
+    uint32_t r = 0;
+    int i;
+
+    for (i = 0; i < 32; i += 8) {
+        r |= ((((t >> i) & 0xFF) * ((c >> i) & 0xFF) + 127) / 255) << i;
+    }
+    return r;
+}
+
+static uint32_t m3_blend(uint32_t tsp, uint32_t src, uint32_t dst)
+{
+    uint32_t fs = (tsp >> 29) & 7, fd = (tsp >> 26) & 7, r = 0;
+    bool on = tsp & M3_TSP_BLEND;
+    uint32_t sa = on ? src >> 24 : 256, da = on ? dst >> 24 : 256;
+    int i;
+
+    for (i = 0; i < 32; i += 8) {
+        uint32_t sc = (src >> i) & 0xFF, dc = (dst >> i) & 0xFF;
+        uint32_t f[2], code[2] = { fs, fd }, other[2] = { dc, sc }, v;
+        int k;
+
+        for (k = 0; k < 2; k++) {
+            switch (code[k]) {
+            case 0:
+                f[k] = 0;
+                break;
+            case 1:
+                f[k] = 256;
+                break;
+            case 2:
+                f[k] = other[k];
+                break;
+            case 3:
+                f[k] = 256 - other[k];
+                break;
+            case 4:
+                f[k] = sa;
+                break;
+            case 5:
+                f[k] = 256 - sa;
+                break;
+            case 6:
+                f[k] = da;
+                break;
+            default:
+                f[k] = 256 - da;
+                break;
+            }
+        }
+        v = ((sc * f[0]) >> 8) + ((dc * f[1]) >> 8);
+        r |= (v > 255 ? 255 : v) << i;
+    }
+    return r;
+}
+
+static double m3_edge(const M3Vertex *a, const M3Vertex *b, double x,
+                      double y)
+{
+    return (b->x - a->x) * (y - a->y) - (b->y - a->y) * (x - a->x);
+}
+
+static void m3_draw(Intel2700GState *s, const M3Obj *o, M3Tile *t)
+{
+    const M3Vertex *v = o->v;
+    double area = m3_edge(&v[0], &v[1], v[2].x, v[2].y), sg;
+    uint32_t mode = (o->tsp >> 9) & 7;
+    int px, py, i;
+
+    if (area == 0) {
+        return;
+    }
+    sg = area > 0 ? 1 : -1;
+    for (py = 0; py < M3_TILE_H; py++) {
+        for (px = 0; px < M3_TILE_W; px++) {
+            double x = t->x + px + 0.5, y = t->y + py + 0.5, w[3], z;
+            bool inside = true, pass;
+            int k = py * M3_TILE_W + px;
+            uint32_t src;
+
+            for (i = 0; i < 3; i++) {
+                const M3Vertex *a = &v[(i + 1) % 3], *b = &v[(i + 2) % 3];
+                double ei = m3_edge(a, b, x, y) * sg;
+                double dx = (b->x - a->x) * sg, dy = (b->y - a->y) * sg;
+                bool tie = dy > 0 || (dy == 0 && dx < 0);
+
+                inside &= ei > 0 || (ei == 0 && tie);
+                w[i] = ei * sg / area;
+            }
+            if (!inside) {
+                continue;
+            }
+            z = w[0] * v[0].z + w[1] * v[1].z + w[2] * v[2].z;
+            switch (mode) {
+            case 4:
+                pass = z > t->z[k];
+                break;
+            case 6:
+                pass = z >= t->z[k];
+                break;
+            case 7:
+                pass = true;
+                break;
+            case 1:
+            case 3:                     /* never passed on the device */
+                pass = false;
+                break;
+            default:
+                qemu_log_mask(LOG_UNIMP, "intel-2700g: depth mode %u never"
+                              " measured\n", mode);
+                pass = false;
+                break;
+            }
+            if (!pass) {
+                continue;
+            }
+            if (o->tsp & M3_TSP_GOURAUD) {
+                int sh;
+
+                src = 0;
+                for (sh = 0; sh < 32; sh += 8) {
+                    double c = 0;
+
+                    for (i = 0; i < 3; i++) {
+                        c += w[i] * ((v[i].argb >> sh) & 0xFF);
+                    }
+                    c = floor(c + 0.5);
+                    src |= (uint32_t)(c < 0 ? 0 : c > 255 ? 255 : c) << sh;
+                }
+            } else {
+                src = v[0].argb;
+            }
+            if (o->textured) {
+                double u = w[0] * v[0].u + w[1] * v[1].u + w[2] * v[2].u;
+                double vv = w[0] * v[0].v + w[1] * v[1].v + w[2] * v[2].v;
+
+                src = m3_modulate(m3_sample(s, o->tex, u, vv), src);
+            }
+            t->c[k] = m3_blend(o->tsp, src, t->c[k]);
+            if (!(o->tsp & M3_TSP_NO_WRITE)) {
+                t->z[k] = z;
+            }
+        }
+    }
+}
+
+/* What a quad adds to a tile, quarter-microseconds (rp-mbx3d-api run 2). */
+static uint32_t m3_quad_cost(const M3Obj *o)
+{
+    return o->tsp & M3_TSP_BLEND ? 20 : o->textured ? 4 : 2;
+}
+
+/*
+ * Renders the region array; returns the render time in microseconds, or
+ * -1 if an object hung the core.
+ */
+static int64_t m3_render(Intel2700GState *s)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t regions = s->mbx[0x608 / 4], params = s->mbx[0x60C / 4];
+    uint32_t target = s->mbx[0x65C / 4], stride = s->mbx[0x660 / 4] * 4;
+    uint32_t r6dc = s->mbx[0x6DC / 4], tiles = 0, cost = 0, k, j;
+    double clear_z = r6dc & 1 ? m3_float(r6dc & ~1u) : NAN;
+    M3Tile *t = g_new(M3Tile, 1);
+
+    for (k = 0; k < 4096; k++) {
+        uint32_t w0 = m3_word(s, regions + 8 * k);
+        uint32_t list = m3_word(s, regions + 8 * k + 4) & M3_ADDR_MASK;
+        int px, py;
+
+        t->x = (w0 & 127) * M3_TILE_W;
+        t->y = ((w0 >> 8) & 127) * M3_TILE_H;
+        for (j = 0; j < M3_TILE_W * M3_TILE_H; j++) {
+            t->c[j] = 0xFFFFFFFF;
+            t->z[j] = clear_z;
+        }
+        for (j = 0; j < 512; j++) {
+            uint32_t p = m3_word(s, list + 4 * j), flags = p & 0xFFE00000;
+            M3Obj o;
+
+            if (p >> 28 == 0xF) {
+                break;
+            }
+            if (flags != M3_STRIP_FLAT && flags != M3_STRIP_TEX) {
+                qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: strip pointer"
+                              " flags 0x%08x never measured\n", flags);
+                break;
+            }
+            m3_object(s, params + (p & 0x001FFFFF) * 4,
+                      flags == M3_STRIP_TEX, &o);
+            if (o.tsp & M3_TSP_HANGS) {
+                g_free(t);
+                return -1;              /* as on the device: until a reset */
+            }
+            m3_draw(s, &o, t);
+            if (j > 0) {
+                cost += m3_quad_cost(&o);
+            }
+        }
+        for (py = 0; py < M3_TILE_H; py++) {
+            for (px = 0; px < M3_TILE_W; px++) {
+                uint64_t a = target + (uint64_t)(t->y + py) * stride +
+                             4 * (t->x + px);
+
+                if (a + 4 <= INTEL_2700G_VRAM_SIZE) {
+                    stl_le_p(vram + a, t->c[py * M3_TILE_W + px]);
+                }
+            }
+        }
+        tiles++;
+        if (w0 & M3_LAST) {
+            break;
+        }
+    }
+    g_free(t);
+    memory_region_set_dirty(&s->vram, 0, INTEL_2700G_VRAM_SIZE);
+    /* Two objects a quad: cost / 2 quarters, then quarters to us. */
+    return 10 + tiles * 21 / 4 + cost / 2 / 4;
+}
+
+static bool m3_passed(int64_t t)
+{
+    return t != M3_NONE && qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= t;
+}
+
+/* Latches the 3D core's status bits whose time has come. */
+static void m3_tick(Intel2700GState *s)
+{
+    if (m3_passed(s->m3_done_ns)) {
+        s->m3_done_ns = M3_NONE;
+        s->mbx[MBX_STATUS / 4] |= M3_RENDER_DONE;
+    }
+    if (m3_passed(s->m3_ready_ns)) {
+        s->m3_ready_ns = M3_NONE;
+        s->mbx[MBX_STATUS / 4] |= M3_PM_READY;
+    }
+}
+
+static bool m3_clock_on(Intel2700GState *s)
+{
+    return (s->regs[R_MBXCLK / 4] & 3) == 2;
+}
+
+/* A write to the MBX block that concerns the 3D core. */
+static void m3_write(Intel2700GState *s, hwaddr off, uint32_t val)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), us;
+
+    if (off == MBX_RESET && val == 0x111) {
+        s->m3_done_ns = s->m3_ready_ns = M3_NONE;
+        s->m3_pm_set = s->m3_hung = false;
+        s->mbx[MBX_STATUS / 4] &= ~(M3_RENDER_DONE | M3_PM_READY);
+    } else if (off == M3_PM_GO && val == 1 && m3_clock_on(s)) {
+        s->m3_pm_set = true;
+        s->m3_ready_ns = now + 164 * SCALE_US;
+    } else if (off == M3_START && val == 1) {
+        /* Nothing without the clock and the manager (version 1), or hung. */
+        if (!m3_clock_on(s) || !s->m3_pm_set || s->m3_hung) {
+            return;
+        }
+        us = m3_render(s);
+        if (us < 0) {
+            s->m3_hung = true;
+            return;
+        }
+        s->m3_done_ns = now + us * SCALE_US;
+    }
+}
+
 static bool i2700g_event_reg(hwaddr addr)
 {
     return addr == R_DINTRS || addr == R_DINTRE || addr == R_DVECTRL ||
@@ -781,6 +1259,7 @@ static MemTxResult i2700g_read(void *opaque, hwaddr addr, uint64_t *data,
             *data = MBX_REV_VALUE;
             break;
         case MBX_STATUS:                /* FIFO level 0: commands run at once */
+            m3_tick(s);
             *data = s->mbx[off / 4] & ~0x40FF0000u;
             break;
         default:
@@ -839,9 +1318,11 @@ static MemTxResult i2700g_write(void *opaque, hwaddr addr, uint64_t val,
         hwaddr off = addr - MBX_BASE;
 
         if (off == MBX_CLEAR) {
+            m3_tick(s);
             s->mbx[MBX_STATUS / 4] &= ~(uint32_t)val;
         } else if (off != MBX_ID && off != MBX_REV && off != MBX_STATUS) {
             s->mbx[off / 4] = val;
+            m3_write(s, off, val);
         }
         return MEMTX_OK;
     }
@@ -1178,6 +1659,8 @@ static void i2700g_reset(DeviceState *dev)
     s->mbx_state = 0;
     s->mbx_skip = 0;
     s->mbx_blend = 0;
+    s->m3_done_ns = s->m3_ready_ns = M3_NONE;
+    s->m3_pm_set = s->m3_hung = false;
     s->ev_epoch = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->ev_line = 0;
     i2700g_irq_update(s);
@@ -1206,8 +1689,8 @@ static void i2700g_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_i2700g = {
     .name = "intel-2700g",
-    .version_id = 4,
-    .minimum_version_id = 4,
+    .version_id = 5,
+    .minimum_version_id = 5,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Intel2700GState, NREGS),
         VMSTATE_BOOL(dark, Intel2700GState),
@@ -1231,13 +1714,18 @@ static const VMStateDescription vmstate_i2700g = {
         VMSTATE_INT64(ev_epoch, Intel2700GState),
         VMSTATE_INT64(ev_line, Intel2700GState),
         VMSTATE_TIMER_PTR(ev_timer, Intel2700GState),
+        VMSTATE_INT64(m3_done_ns, Intel2700GState),
+        VMSTATE_INT64(m3_ready_ns, Intel2700GState),
+        VMSTATE_BOOL(m3_pm_set, Intel2700GState),
+        VMSTATE_BOOL(m3_hung, Intel2700GState),
         VMSTATE_END_OF_LIST()
     },
 };
 
 /*
  * mbx-2d (from rp-v0.12.0): the MBX 2D engine is modelled; mbx-blend (from
- * rp-v0.13.0): its blending and the display's events as measured.
+ * rp-v0.13.0): its blending and the display's events as measured; mbx-3d
+ * (from rp-v0.15.0): the 3D core's direct path.
  */
 static bool i2700g_get_mbx_2d(Object *obj, Error **errp)
 {
@@ -1255,6 +1743,7 @@ static void i2700g_class_init(ObjectClass *klass, void *data)
     object_class_property_add_bool(klass, "mbx-2d", i2700g_get_mbx_2d, NULL);
     object_class_property_add_bool(klass, "mbx-blend", i2700g_get_mbx_2d,
                                    NULL);
+    object_class_property_add_bool(klass, "mbx-3d", i2700g_get_mbx_2d, NULL);
 }
 
 static const TypeInfo i2700g_info = {
