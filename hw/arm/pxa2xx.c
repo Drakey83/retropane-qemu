@@ -191,7 +191,8 @@ static uint64_t pxa2xx_cm_read(void *opaque, hwaddr addr,
         return s->cm_regs[addr >> 2];
 
     case CCSR:
-        return s->cm_regs[CCCR >> 2] | (3 << 28);
+        /* The multipliers in use: CCCR's as of the last F write. */
+        return s->ccsr_lat | (3 << 28);
 
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -246,6 +247,43 @@ static const VMStateDescription vmstate_pxa2xx_cm = {
     }
 };
 
+/*
+ * The core clock in kHz from the latched multipliers and CLKCFG (PXA27x
+ * manual section 3; retropane-os rp_hal_pxa27x::clocks): run = 13 MHz x L,
+ * turbo = run x 2N / 2, half-turbo half of that.
+ */
+static uint32_t pxa2xx_core_khz(PXA2xxState *s)
+{
+    uint32_t l = s->ccsr_lat & 0x1f;
+    uint32_t n2 = (s->ccsr_lat >> 7) & 0xf;
+    uint32_t run = 13000 * (l < 2 ? 1 : l);
+
+    if (!(s->clkcfg & 1)) {
+        return run;
+    }
+    return (s->clkcfg & 4) ? run * n2 / 4 : run * n2 / 2;
+}
+
+/* CCNT now: frozen while PMNC's enable bit is clear. */
+static uint64_t pxa2xx_ccnt_now(PXA2xxState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (!(s->pmnc & 1)) {
+        return s->ccnt_acc;
+    }
+    return s->ccnt_acc +
+        muldiv64(now - s->ccnt_anchor, s->core_khz, 1000000);
+}
+
+/* Starts a new stretch of counting at the current core clock. */
+static void pxa2xx_ccnt_rebase(PXA2xxState *s)
+{
+    s->ccnt_acc = pxa2xx_ccnt_now(s);
+    s->ccnt_anchor = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->core_khz = pxa2xx_core_khz(s);
+}
+
 static uint64_t pxa2xx_clkcfg_read(CPUARMState *env, const ARMCPRegInfo *ri)
 {
     PXA2xxState *s = (PXA2xxState *)ri->opaque;
@@ -256,10 +294,14 @@ static void pxa2xx_clkcfg_write(CPUARMState *env, const ARMCPRegInfo *ri,
                                 uint64_t value)
 {
     PXA2xxState *s = (PXA2xxState *)ri->opaque;
+    s->ccnt_acc = pxa2xx_ccnt_now(s);
+    s->ccnt_anchor = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->clkcfg = value & 0xf;
     if (value & 2) {
-        printf("%s: CPU frequency change attempt\n", __func__);
+        /* F: the core PLL relocks to CCCR's multipliers. */
+        s->ccsr_lat = s->cm_regs[CCCR >> 2];
     }
+    s->core_khz = pxa2xx_core_khz(s);
 }
 
 static void pxa2xx_pwrmode_write(CPUARMState *env, const ARMCPRegInfo *ri,
@@ -341,7 +383,13 @@ static void pxa2xx_cppmnc_write(CPUARMState *env, const ARMCPRegInfo *ri,
                                 uint64_t value)
 {
     PXA2xxState *s = (PXA2xxState *)ri->opaque;
-    s->pmnc = value;
+    s->ccnt_acc = pxa2xx_ccnt_now(s);
+    s->ccnt_anchor = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (value & 4) {
+        s->ccnt_acc = 0; /* C: reset the cycle counter */
+    }
+    s->pmnc = value & ~4;
+    s->core_khz = pxa2xx_core_khz(s);
 }
 
 /* PMNC resets to 0 (the cycle counter stopped), as after a watchdog reset. */
@@ -349,16 +397,13 @@ static void pxa2xx_cppmnc_reset(CPUARMState *env, const ARMCPRegInfo *ri)
 {
     PXA2xxState *s = (PXA2xxState *)ri->opaque;
     s->pmnc = 0;
+    s->ccnt_acc = 0;
 }
 
 static uint64_t pxa2xx_cpccnt_read(CPUARMState *env, const ARMCPRegInfo *ri)
 {
     PXA2xxState *s = (PXA2xxState *)ri->opaque;
-    if (s->pmnc & 1) {
-        return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    } else {
-        return 0;
-    }
+    return (uint32_t)pxa2xx_ccnt_now(s);
 }
 
 static const ARMCPRegInfo pxa_cp_reginfo[] = {
@@ -2188,6 +2233,8 @@ PXA2xxState *pxa270_init(unsigned int sdram_size, const char *cpu_type)
     s->cm_base = 0x41300000;
     s->cm_regs[CCCR >> 2] = 0x02000210;	/* 416.0 MHz */
     s->clkcfg = 0x00000009;		/* Turbo mode active */
+    s->ccsr_lat = s->cm_regs[CCCR >> 2];
+    pxa2xx_ccnt_rebase(s);
     memory_region_init_io(&s->cm_iomem, NULL, &pxa2xx_cm_ops, s, "pxa2xx-cm", 0x1000);
     memory_region_add_subregion(address_space, s->cm_base, &s->cm_iomem);
     vmstate_register(NULL, 0, &vmstate_pxa2xx_cm, s);
@@ -2323,6 +2370,7 @@ PXA2xxState *pxa255_init(unsigned int sdram_size)
 
     s->cm_base = 0x41300000;
     s->cm_regs[CCCR >> 2] = 0x00000121;         /* from datasheet */
+    s->ccsr_lat = s->cm_regs[CCCR >> 2];
     s->cm_regs[CKEN >> 2] = 0x00017def;         /* from datasheet */
 
     s->clkcfg = 0x00000009;		/* Turbo mode active */
