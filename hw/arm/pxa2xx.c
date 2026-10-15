@@ -344,6 +344,13 @@ static void pxa2xx_cppmnc_write(CPUARMState *env, const ARMCPRegInfo *ri,
     s->pmnc = value;
 }
 
+/* PMNC resets to 0 (the cycle counter stopped), as after a watchdog reset. */
+static void pxa2xx_cppmnc_reset(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    PXA2xxState *s = (PXA2xxState *)ri->opaque;
+    s->pmnc = 0;
+}
+
 static uint64_t pxa2xx_cpccnt_read(CPUARMState *env, const ARMCPRegInfo *ri)
 {
     PXA2xxState *s = (PXA2xxState *)ri->opaque;
@@ -358,9 +365,15 @@ static const ARMCPRegInfo pxa_cp_reginfo[] = {
     /* cp14 crm==1: perf registers */
     { .name = "CPPMNC", .cp = 14, .crn = 0, .crm = 1, .opc1 = 0, .opc2 = 0,
       .access = PL1_RW, .type = ARM_CP_IO,
-      .readfn = pxa2xx_cppmnc_read, .writefn = pxa2xx_cppmnc_write },
+      .readfn = pxa2xx_cppmnc_read, .writefn = pxa2xx_cppmnc_write,
+      .resetfn = pxa2xx_cppmnc_reset },
+    /*
+     * CCNT reads the clock, so it has no raw state to reset or migrate:
+     * without NO_RAW a machine reset with the counter running (a watchdog
+     * reset of a hung image) failed cp_reg_check_reset's assertion.
+     */
     { .name = "CPCCNT", .cp = 14, .crn = 1, .crm = 1, .opc1 = 0, .opc2 = 0,
-      .access = PL1_RW, .type = ARM_CP_IO,
+      .access = PL1_RW, .type = ARM_CP_IO | ARM_CP_NO_RAW,
       .readfn = pxa2xx_cpccnt_read, .writefn = arm_cp_write_ignore },
     { .name = "CPINTEN", .cp = 14, .crn = 4, .crm = 1, .opc1 = 0, .opc2 = 0,
       .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
