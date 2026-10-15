@@ -934,10 +934,16 @@ static uint32_t m3_argb(uint32_t a, uint32_t r, uint32_t g, uint32_t b)
 
 /* Texel (x, y) of the texture, ARGB8888. */
 static uint32_t m3_texel(Intel2700GState *s, const uint32_t tex[3],
-                         uint32_t x, uint32_t y)
+                         uint32_t level, uint32_t x, uint32_t y)
 {
     uint32_t base = (tex[1] & 0x01FFFFFF) << 7;
-    uint32_t format = (tex[0] >> 13) & 0x1F, a, t;
+    uint32_t format = (tex[0] >> 13) & 0x1F, a, t, k;
+    uint32_t side = 8u << ((tex[0] >> 24) & 15);
+
+    /* Mip levels after the base, each after the larger one (version 25). */
+    for (k = 0; k < level; k++) {
+        base += (side >> k) * (side >> k) * (format == 12 ? 4 : 2);
+    }
 
     switch (format) {
     case 12:                            /* ARGB8888 (rp-mbx3d version 24) */
@@ -990,17 +996,19 @@ static uint32_t m3_texel(Intel2700GState *s, const uint32_t tex[3],
  * channel truncated; the caller samples at the pixel's corner).
  */
 static uint32_t m3_sample(Intel2700GState *s, const uint32_t tex[3],
-                          double u, double v)
+                          double u, double v, uint32_t level)
 {
     uint32_t tex0 = tex[0], mu = tex0 >> 30, mv = (tex0 >> 28) & 3, r = 0;
-    int64_t su = 8ll << ((tex0 >> 24) & 15), sv = 8ll << ((tex0 >> 20) & 15);
+    int64_t su = (8ll << ((tex0 >> 24) & 15)) >> level;
+    int64_t sv = (8ll << ((tex0 >> 20) & 15)) >> level;
     double tu, tv, fx, fy;
     int64_t x0, y0;
     uint32_t q[4];
     int i;
 
     if (!(tex[1] & (1u << 31))) {
-        return m3_texel(s, tex, m3_address(u, su, mu), m3_address(v, sv, mv));
+        return m3_texel(s, tex, level, m3_address(u, su, mu),
+                        m3_address(v, sv, mv));
     }
     tu = u * su - 0.5;
     tv = v * sv - 0.5;
@@ -1012,7 +1020,8 @@ static uint32_t m3_sample(Intel2700GState *s, const uint32_t tex[3],
         double cu = (double)(x0 + (i & 1)) / su + 0.5 / su;
         double cv = (double)(y0 + (i >> 1)) / sv + 0.5 / sv;
 
-        q[i] = m3_texel(s, tex, m3_address(cu, su, mu), m3_address(cv, sv, mv));
+        q[i] = m3_texel(s, tex, level, m3_address(cu, su, mu),
+                        m3_address(cv, sv, mv));
     }
     for (i = 0; i < 32; i += 8) {
         double c0 = (q[0] >> i) & 0xFF, c1 = (q[1] >> i) & 0xFF;
@@ -1086,6 +1095,48 @@ static double m3_edge(const M3Vertex *a, const M3Vertex *b, double x,
                       double y)
 {
     return (b->x - a->x) * (y - a->y) - (b->y - a->y) * (x - a->x);
+}
+
+/* The texture coordinates of object `o` at (x, y). */
+static void m3_uv(const M3Obj *o, double x, double y, double area,
+                  double *u, double *v)
+{
+    double w[3];
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        w[i] = m3_edge(&o->v[(i + 1) % 3], &o->v[(i + 2) % 3], x, y) / area;
+    }
+    *u = w[0] * o->v[0].u + w[1] * o->v[1].u + w[2] * o->v[2].u;
+    *v = w[0] * o->v[0].v + w[1] * o->v[1].v + w[2] * o->v[2].v;
+}
+
+/*
+ * The mip level a pixel samples: with TEX1 bits 30-29 = 1 (the nearest
+ * level), the one whose texels match the pixels (the larger step in
+ * texels across and down; version 25: a 64 x 64 texture over 16 and 8 px
+ * drew levels 2 and 3), up to TEX0 bits 12-9 (0: the base only). Between
+ * powers of two the nearest in log2 is assumed.
+ */
+static uint32_t m3_mip_level(const M3Obj *o, double x, double y, double area)
+{
+    double u0, v0, u1, v1, u2, v2, size, step;
+    uint32_t top, level;
+
+    if ((o->tex[1] & 0x60000000) != 0x20000000) {
+        return 0;
+    }
+    size = 8u << ((o->tex[0] >> 24) & 15);
+    m3_uv(o, x, y, area, &u0, &v0);
+    m3_uv(o, x + 1, y, area, &u1, &v1);
+    m3_uv(o, x, y + 1, area, &u2, &v2);
+    step = fmax(hypot(u1 - u0, v1 - v0), hypot(u2 - u0, v2 - v0)) * size;
+    top = MIN((o->tex[0] >> 9) & 15, ((o->tex[0] >> 24) & 15) + 3);
+    if (step <= 1) {
+        return 0;
+    }
+    level = (uint32_t)lround(log2(step));
+    return MIN(level, top);
 }
 
 static void m3_draw(Intel2700GState *s, const M3Obj *o, M3Tile *t)
@@ -1180,7 +1231,7 @@ static void m3_draw(Intel2700GState *s, const M3Obj *o, M3Tile *t)
                  * TEX2 bit 13 (Dell's opaque combine word) makes the
                  * texel's alpha 1 (versions 23 and 24).
                  */
-                tx = m3_sample(s, o->tex, u, vv);
+                tx = m3_sample(s, o->tex, u, vv, m3_mip_level(o, x, y, area));
                 if (o->tex[2] & (1u << 13)) {
                     tx |= 0xFF000000;
                 }
