@@ -1300,13 +1300,36 @@ static int64_t m3_render(Intel2700GState *s)
                 cost += m3_quad_cost(&o);
             }
         }
+        /*
+         * The target's format (0x650, rp-mbx3d version 26): 6 ARGB8888,
+         * 1 RGB565, 3 ARGB1555 (channels truncated, the alpha bit from
+         * bit 7: assumed); tiles stay 8 x 16.
+         */
         for (py = 0; py < M3_TILE_H; py++) {
             for (px = 0; px < M3_TILE_W; px++) {
-                uint64_t a = target + (uint64_t)(t->y + py) * stride +
-                             4 * (t->x + px);
+                uint32_t c = t->c[py * M3_TILE_W + px], fmt = s->mbx[0x650 / 4];
+                uint32_t r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+                uint64_t row = target + (uint64_t)(t->y + py) * stride;
 
-                if (a + 4 <= INTEL_2700G_VRAM_SIZE) {
-                    stl_le_p(vram + a, t->c[py * M3_TILE_W + px]);
+                if (fmt == 1 || fmt == 3) {
+                    uint64_t a = row + 2 * (t->x + px);
+                    uint32_t v = fmt == 1
+                        ? (r >> 3) << 11 | (g >> 2) << 5 | b >> 3
+                        : (c >> 31) << 15 | (r >> 3) << 10 | (g >> 3) << 5 | b >> 3;
+
+                    if (a + 2 <= INTEL_2700G_VRAM_SIZE) {
+                        stw_le_p(vram + a, v);
+                    }
+                } else {
+                    uint64_t a = row + 4 * (t->x + px);
+
+                    if (fmt != 6) {
+                        qemu_log_mask(LOG_UNIMP, "intel-2700g: 3D target"
+                                      " format %u never measured\n", fmt);
+                    }
+                    if (a + 4 <= INTEL_2700G_VRAM_SIZE) {
+                        stl_le_p(vram + a, c);
+                    }
                 }
             }
         }
