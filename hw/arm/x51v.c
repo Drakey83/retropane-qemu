@@ -88,12 +88,13 @@ static struct arm_boot_info x51v_binfo = {
 /*
  * The CF slot's power and RESET, both CPLD outputs, and READY on GPIO84
  * (retropane-os docs/hw/cf.md "Slot power and reset", from Dell's socket
- * driver and device runs). The slot starts unpowered, as Windows Mobile
- * hands over: the card answers (and GPIO84 reads high) only once software
- * switches both power bits on, so a driver without the power sequence reads
- * zeros, as on the device. Power-up and the release of RESET put the card in
- * its power-on state (memory mode, idle); while RESET is held the card
- * doesn't answer, but GPIO84 stays high (it shows slot power, measured).
+ * driver and device runs). The card answers (and GPIO84 reads high) only
+ * while both power bits are on; the slot starts powered, as Windows Mobile
+ * hands over (its CPLD table, measured: the x51v-cpld latches), so a driver
+ * that cuts a power bit it doesn't own reads zeros, as on the device.
+ * Power-up and the release of RESET put the card in its power-on state
+ * (memory mode, idle); while RESET is held the card doesn't answer, but
+ * GPIO84 stays high (it shows slot power, measured).
  * QEMU's card answers at once: busy times are not modelled.
  *
  * Tests pull the card out and push it back in through the "cfslot" switch:

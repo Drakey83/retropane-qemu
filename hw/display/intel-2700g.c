@@ -25,8 +25,18 @@
  * Not modelled (the registers just read back what was written): the MBX 3D
  * core's tile accelerator, the 2D engine's other operations (scaling, rotation, palettes,
  * masks, ROPs other than copy and pattern copy), the MVED1 decoder, the
- * hardware cursor, colour keys, gamma, the video scaler (the video plane is
- * shown 1:1), scan-out under/overruns and the PLLs.
+ * hardware cursor, colour keys, the video plane's gamma, the video scaler
+ * (the video plane is shown 1:1), scan-out under/overruns and the PLLs.
+ *
+ * Gamma (graphics plane): while GSCTRL bit 26 is set, each 8-bit lane of
+ * the plane's pixels goes through the 17-entry table GFXGAM0-16
+ * (0x00RRGGBB, a point every 16 levels, entry 16 at 256) before mixing,
+ * linear between points, truncated (RetroPane's reference, retropane-os
+ * drivers/mbx-display scanout::gamma). The table starts as Windows Mobile
+ * leaves it on the X51v, a grey ramp (retropane-os rp-nightlight,
+ * 2026-10-16); GSCTRL starts at 0, so gamma is off until software sets it.
+ * The table's form and WM's ramp are measured; the interpolation is
+ * assumed.
  *
  * The panel's backlight is not the 2700G's, but it decides what the screen
  * shows: the "backlight" GPIO input (the X51v's CPLD 0x18 bit 2) low shows
@@ -70,6 +80,8 @@
 #define R_VUBASE        0x2084
 #define R_VVBASE        0x20A4
 #define R_GSADR         0x20C0
+#define R_GFXGAM0       0x2250
+#define GAMMA_ENTRIES   17
 #define R_VSADR         0x20C4
 #define R_DSCTRL        0x2154
 #define R_BGCOLOR       0x2174
@@ -85,6 +97,7 @@
 #define SCTRL_WIDTH(v)      ((((v) >> 11) & 0x7FF) + 1)
 #define SCTRL_HEIGHT(v)     (((v) & 0x7FF) + 1)
 #define VSCTRL_CSC_EN       (1u << 25)
+#define GSCTRL_GAMMA_EN     (1u << 26)
 #define SCADR_STR_EN        (1u << 31)
 #define SCADR_COLKEY_EN     (1u << 30)
 #define SCADR_BLEND_M(v)    (((v) >> 27) & 0x3)
@@ -1551,6 +1564,7 @@ typedef struct Plane {
     int mode;
     int slot;
     int glalpha;
+    const uint32_t *gamma;              /* GFXGAM0-16 while enabled, else NULL */
 } Plane;
 
 static int clamp8(int v)
@@ -1612,6 +1626,8 @@ static Plane plane_from_regs(Intel2700GState *s, bool video)
         .mode = SCADR_BLEND_M(scadr),
         .slot = SCADR_BLEND_POS(scadr),
         .glalpha = BBASE_GLALPHA(bbase),
+        .gamma = !video && (sctrl & GSCTRL_GAMMA_EN) ?
+                 &s->regs[R_GFXGAM0 / 4] : NULL,
     };
     bool video_fmt = p.fmt == FMT_YUV_PLANAR || p.fmt >= FMT_UY0VY1;
     uint64_t size = memory_region_size(&s->vram);
@@ -1720,6 +1736,16 @@ static void plane_pixel(const Plane *p, const uint8_t *vram, int px, int py,
     }
 }
 
+/* Lane `shift` of v through the gamma table: linear between the points
+ * at 16 * i, truncated toward zero. */
+static int gamma_lane(const uint32_t *t, int v, int shift)
+{
+    int i = v >> 4, f = v & 15;
+    int lo = (t[i] >> shift) & 0xFF, hi = (t[i + 1] >> shift) & 0xFF;
+
+    return lo + (hi - lo) * f / 16;
+}
+
 static void i2700g_update(void *opaque)
 {
     Intel2700GState *s = opaque;
@@ -1782,6 +1808,11 @@ static void i2700g_update(void *opaque)
                     continue;
                 }
                 plane_pixel(p, vram, px, py, &sr, &sg, &sb, &sa);
+                if (p->gamma) {
+                    sr = gamma_lane(p->gamma, sr, 16);
+                    sg = gamma_lane(p->gamma, sg, 8);
+                    sb = gamma_lane(p->gamma, sb, 0);
+                }
                 switch (p->mode) {
                 case BLEND_PIX:
                     k = sa;
@@ -1827,11 +1858,20 @@ static const GraphicHwOps i2700g_gfx_ops = {
     .gfx_update = i2700g_update,
 };
 
+/* Windows Mobile's gamma table on the X51v, one lane (all three equal). */
+static const uint8_t wm_gamma[GAMMA_ENTRIES] = {
+    0x00, 0x0F, 0x1F, 0x2F, 0x3F, 0x4F, 0x5F, 0x6F, 0x7F,
+    0x8E, 0x9E, 0xAE, 0xBE, 0xCE, 0xDE, 0xEE, 0xFD,
+};
+
 static void i2700g_reset(DeviceState *dev)
 {
     Intel2700GState *s = INTEL_2700G(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    for (int i = 0; i < GAMMA_ENTRIES; i++) {
+        s->regs[R_GFXGAM0 / 4 + i] = wm_gamma[i] * 0x010101;
+    }
     memset(s->mbx, 0, sizeof(s->mbx));
     s->mbx_state = 0;
     s->mbx_skip = 0;

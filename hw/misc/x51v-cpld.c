@@ -17,9 +17,13 @@
  *   0x16 bit 1 and 0x10 bit 12 both set; "cf-reset": 0x18 bit 1;
  *   "backlight": 0x18 bit 2). The machine wires them to the CF socket and
  *   the panel. Other bits are logged (-d unimp) and have no effect.
- * - The latches start as Windows Mobile hands over: backlight enabled
- *   (0x18 bit 2), the CF slot off, everything else 0. So a driver that
- *   writes 0x18 without the backlight bit darkens the screen, as on the
+ * - The latches start as Windows Mobile hands over, its shared shadow
+ *   table as measured on the X51v (retropane-os rp-handover, 2026-10-16):
+ *   02=00FD 10=1000 12=000F 14=0008 16=0003 18=0004 1A=0006 1C=000C,
+ *   the rest 0. So the backlight is on (0x18 bit 2), the CF slot powered
+ *   (0x16 bit 1, 0x10 bit 12) and out of reset, SD power on (0x16 bit 0);
+ *   a driver that writes 0x18 without the backlight bit darkens the screen,
+ *   and one that writes 0x16 without bit 1 cuts the CF slot, as on the
  *   device.
  */
 
@@ -46,6 +50,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(X51vCpldState, X51V_CPLD)
 #define CF_POWER_2      0x1000  /* 0x10 */
 #define CF_RESET        0x0002  /* 0x18 */
 #define BACKLIGHT_EN    0x0004  /* 0x18 */
+
+/* The latches as Windows Mobile hands over (its shadow table, measured). */
+static const uint16_t cpld_wm_latches[NREGS] = {
+    [0x02 / 2] = 0x00FD,
+    [0x10 / 2] = 0x1000,
+    [0x12 / 2] = 0x000F,
+    [0x14 / 2] = 0x0008,
+    [0x16 / 2] = 0x0003,
+    [0x18 / 2] = 0x0004,
+    [0x1A / 2] = 0x0006,
+    [0x1C / 2] = 0x000C,
+};
 
 /* What reads return (status inputs), as measured with Windows Mobile's
  * state; 0x04 bit 1 follows the CF card. */
@@ -120,8 +136,7 @@ static void cpld_reset(DeviceState *dev)
 {
     X51vCpldState *s = X51V_CPLD(dev);
 
-    memset(s->regs, 0, sizeof(s->regs));
-    s->regs[R_CTL18 / 2] = BACKLIGHT_EN;    /* as Windows Mobile hands over */
+    memcpy(s->regs, cpld_wm_latches, sizeof(s->regs));
     cpld_update_outputs(s);
 }
 
