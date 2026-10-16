@@ -28,6 +28,17 @@
  * functions run at the same time; the serial port's open requests don't hold
  * up the drive.
  *
+ * Bulk endpoints as measured on the real X51v (retropane-os item 74,
+ * docs/hw/udc.md, 2026-10-16): one packet buffer, or two with UDCCRx.DE
+ * (double buffering); an OUT packet shorter than the maximum sets UDCCSRx.SP
+ * while it is the one being read; an IN endpoint reads "not full" while a
+ * buffer is free and no short packet waits (none is queued behind one);
+ * each packet the host takes or delivers sets the slot's packet-complete
+ * event in UDCISR0 (bit 2x); with UDCCSRx.DME the slot drives its DMA
+ * request (named GPIO "dreq", slot x: the PXA27x's request 24 + x): OUT
+ * while the packet being read has bytes left, and a packet read to its end
+ * by DMA is released without the guest's PC; IN while a buffer has room.
+ *
  * The host is strict where the hardware is: a packet waits in its FIFO until
  * the host's next IN token (one host step), a full FIFO is sent without IPR,
  * a host-to-device request ends with the guest's zero-length status IN (IPR,
@@ -74,6 +85,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pxa27xUdcState, PXA27X_UDC)
 #define ISR1_RESET  (1u << 27)
 #define ISR1_CC     (1u << 31)
 #define ISR0_EP0    (1u << 0)
+/* Packet complete of endpoint slot x (1 = A). */
+#define ISR0_PKT(x) (1u << (2 * (x)))
+
+#define CR_DE       (1 << 1)
 
 #define CSR0_OPC    (1 << 0)
 #define CSR0_IPR    (1 << 1)
@@ -85,6 +100,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pxa27xUdcState, PXA27X_UDC)
 #define CSR0_AREN   (1 << 8)
 
 #define CSR_PC      (1 << 1)
+#define CSR_DME     (1 << 3)
 #define CSR_BNX     (1 << 6)
 #define CSR_SP      (1 << 7)
 #define CSR_FEF     (1 << 8)
@@ -126,17 +142,29 @@ enum xfer_phase {
     X_WAIT_ACK,     /* SET_CONFIGURATION: waiting for AREN */
 };
 
-/* One bulk endpoint slot's FIFO, as the host and the guest see it. */
-typedef struct BulkFifo {
-    uint8_t pkt[BULK_SIZE];
+/* One packet buffer. */
+typedef struct BulkPkt {
+    uint8_t d[BULK_SIZE];
     uint32_t len, pos;
-    bool ready;         /* IN: a packet waits for the host's IN token */
+} BulkPkt;
+
+/* One bulk endpoint slot, as the host and the guest see it: IN, `fill` is
+ * the buffer being written and `q` the committed packets waiting for the
+ * host's IN tokens; OUT, `q` holds the packets received, the front one
+ * being read. One buffer, or two with UDCCRx.DE. */
+typedef struct BulkFifo {
+    BulkPkt fill;
+    BulkPkt q[2];
+    uint32_t head, count;
 } BulkFifo;
 
 struct Pxa27xUdcState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     qemu_irq irq;
+    /* DMA requests, by slot (the PXA27x's request 24 + slot). */
+    qemu_irq dreq[NEP];
+    bool dreq_level[NEP];
     CharBackend chr;
     CharBackend msc;
     QEMUTimer *timer;
@@ -221,6 +249,90 @@ static bool slot_is_in(Pxa27xUdcState *s, int x)
     return (s->cr[x] >> 12) & 1;
 }
 
+/* Packet buffers of slot x: two with double buffering (UDCCRx.DE). */
+static unsigned slot_depth(Pxa27xUdcState *s, int x)
+{
+    return (s->cr[x] & CR_DE) ? 2 : 1;
+}
+
+static BulkPkt *bulk_front(BulkFifo *f)
+{
+    return f->count ? &f->q[f->head] : NULL;
+}
+
+static void bulk_pop(BulkFifo *f)
+{
+    if (f->count) {
+        f->head = (f->head + 1) % 2;
+        f->count--;
+    }
+}
+
+static bool bulk_push(BulkFifo *f, unsigned depth, const uint8_t *b,
+                      uint32_t n)
+{
+    if (f->count >= depth) {
+        return false;
+    }
+    BulkPkt *p = &f->q[(f->head + f->count) % 2];
+    memcpy(p->d, b, n);
+    p->len = n;
+    p->pos = 0;
+    f->count++;
+    return true;
+}
+
+/* IN: a committed short packet waits (measured: nothing goes in behind
+ * one, the endpoint reads full until it has gone). */
+static bool bulk_short_waits(BulkFifo *f)
+{
+    for (uint32_t i = 0; i < f->count; i++) {
+        if (f->q[(f->head + i) % 2].len < BULK_SIZE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* IN: room for the guest's next bytes ("buffer not full"). */
+static bool in_room(Pxa27xUdcState *s, int x)
+{
+    BulkFifo *f = &s->bulk[x];
+    return f->count < slot_depth(s, x) && !bulk_short_waits(f) &&
+           f->fill.len < BULK_SIZE;
+}
+
+/* Drives each bulk slot's DMA request from its state. */
+static void udc_update_dreq(Pxa27xUdcState *s)
+{
+    for (int x = 1; x < NEP; x++) {
+        bool on = false;
+        if (slot_active_bulk(s, x) && (s->csr[x] & CSR_DME)) {
+            if (slot_is_in(s, x)) {
+                on = in_room(s, x);
+            } else {
+                BulkPkt *p = bulk_front(&s->bulk[x]);
+                on = p && p->pos < p->len;
+            }
+        }
+        if (on != s->dreq_level[x]) {
+            s->dreq_level[x] = on;
+            qemu_set_irq(s->dreq[x], on);
+        }
+    }
+}
+
+/* IN: the buffer being written becomes a packet for the host. */
+static void in_commit(Pxa27xUdcState *s, int x)
+{
+    BulkFifo *f = &s->bulk[x];
+    if (!bulk_push(f, slot_depth(s, x), f->fill.d, f->fill.len)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "pxa27x-udc: bulk IN slot %d "
+                      "committed a packet with no free buffer\n", x);
+    }
+    f->fill.len = 0;
+}
+
 /* The active bulk slot for endpoint `number` in direction `in`; with
  * number 0, the first active bulk slot in that direction. */
 static int find_slot(Pxa27xUdcState *s, uint8_t number, bool in)
@@ -248,6 +360,7 @@ static void host_reset_bus(Pxa27xUdcState *s)
     s->open_step = 0;
     s->isr1 |= ISR1_RESET;
     udc_update_irq(s);
+    udc_update_dreq(s);
 }
 
 static void host_fail(Pxa27xUdcState *s, const char *why)
@@ -507,35 +620,40 @@ static void host_open_step(Pxa27xUdcState *s)
     }
 }
 
-/* IN token on slot x: a waiting packet is taken; returns its length or -1. */
+/* IN token on slot x: the oldest waiting packet is taken; returns its
+ * length or -1. */
 static int host_take_in(Pxa27xUdcState *s, int x, uint8_t *out)
 {
-    BulkFifo *f = &s->bulk[x];
-    if (x <= 0 || !f->ready) {
+    if (x <= 0) {
         return -1;
     }
-    int n = f->len;
-    memcpy(out, f->pkt, n);
-    f->len = 0;
-    f->ready = false;
+    BulkPkt *p = bulk_front(&s->bulk[x]);
+    if (!p) {
+        return -1;
+    }
+    int n = p->len;
+    memcpy(out, p->d, n);
+    bulk_pop(&s->bulk[x]);
     s->csr[x] |= CSR_PC;
+    s->isr0 |= ISR0_PKT(x);
+    udc_update_irq(s);
+    udc_update_dreq(s);
     return n;
 }
 
-/* OUT token on slot x, when the guest has released the previous packet. */
+/* OUT token on slot x: accepted while a packet buffer is free. */
 static bool host_can_out(Pxa27xUdcState *s, int x)
 {
-    return x > 0 && !(s->csr[x] & CSR_PC);
+    return x > 0 && s->bulk[x].count < slot_depth(s, x);
 }
 
 static void host_put_out(Pxa27xUdcState *s, int x, const uint8_t *b,
                          uint32_t n)
 {
-    BulkFifo *f = &s->bulk[x];
-    memcpy(f->pkt, b, n);
-    f->len = n;
-    f->pos = 0;
-    s->csr[x] |= CSR_PC;
+    bulk_push(&s->bulk[x], slot_depth(s, x), b, n);
+    s->isr0 |= ISR0_PKT(x);
+    udc_update_irq(s);
+    udc_update_dreq(s);
 }
 
 static void host_bridge_serial(Pxa27xUdcState *s)
@@ -728,17 +846,18 @@ static void ep0_push(Pxa27xUdcState *s, const uint8_t *b, unsigned n)
 static void in_push(Pxa27xUdcState *s, int x, const uint8_t *b, unsigned n)
 {
     BulkFifo *f = &s->bulk[x];
-    if (f->ready) {
+    if (f->count >= slot_depth(s, x) || bulk_short_waits(f)) {
         qemu_log_mask(LOG_GUEST_ERROR, "pxa27x-udc: wrote bulk IN slot %d "
-                      "while a packet waits for the host\n", x);
+                      "with no free buffer\n", x);
         return;
     }
-    for (unsigned i = 0; i < n && f->len < BULK_SIZE; i++) {
-        f->pkt[f->len++] = b[i];
+    for (unsigned i = 0; i < n && f->fill.len < BULK_SIZE; i++) {
+        f->fill.d[f->fill.len++] = b[i];
     }
-    if (f->len >= BULK_SIZE) {
-        f->ready = true;
+    if (f->fill.len >= BULK_SIZE) {
+        in_commit(s, x);
     }
+    udc_update_dreq(s);
 }
 
 /* The active bulk slot a CSR/BCR/DR address belongs to, or -1. */
@@ -773,10 +892,23 @@ static uint64_t udc_read(void *opaque, hwaddr addr, unsigned size)
         int y = (addr - CSR(0)) / 4;
         uint32_t v = s->csr[y];
         if (slot_active_bulk(s, y)) {
-            BulkFifo *f = &s->bulk[y];
-            if (slot_is_in(s, y) ? (!f->ready && f->len < BULK_SIZE)
-                                 : (f->pos < f->len)) {
-                v |= CSR_BNX; /* IN: not full; OUT: not empty */
+            if (slot_is_in(s, y)) {
+                if (in_room(s, y)) {
+                    v |= CSR_BNX; /* not full */
+                }
+            } else {
+                /* The packet being read: complete, short, not empty. */
+                BulkPkt *p = bulk_front(&s->bulk[y]);
+                v &= ~(CSR_PC | CSR_SP);
+                if (p) {
+                    v |= CSR_PC;
+                    if (p->len < BULK_SIZE) {
+                        v |= CSR_SP;
+                    }
+                    if (p->pos < p->len) {
+                        v |= CSR_BNX;
+                    }
+                }
             }
         }
         return v;
@@ -785,7 +917,8 @@ static uint64_t udc_read(void *opaque, hwaddr addr, unsigned size)
         return fifo8_num_used(&s->ep0_rx);
     }
     if ((x = bulk_slot(s, addr, BCR(0))) > 0 && !slot_is_in(s, x)) {
-        return s->bulk[x].len - s->bulk[x].pos;
+        BulkPkt *p = bulk_front(&s->bulk[x]);
+        return p ? p->len - p->pos : 0;
     }
     if (addr == DR(0)) {
         uint32_t v = 0;
@@ -796,12 +929,18 @@ static uint64_t udc_read(void *opaque, hwaddr addr, unsigned size)
         return v;
     }
     if ((x = bulk_slot(s, addr, DR(0))) > 0 && !slot_is_in(s, x)) {
-        BulkFifo *f = &s->bulk[x];
+        BulkPkt *p = bulk_front(&s->bulk[x]);
         uint32_t v = 0;
         for (unsigned i = 0; i < size; i++) {
-            uint8_t b = f->pos < f->len ? f->pkt[f->pos++] : 0;
+            uint8_t b = p && p->pos < p->len ? p->d[p->pos++] : 0;
             v |= (uint32_t)b << (8 * i);
         }
+        /* Read to its end by DMA: released without the guest's PC (the
+         * X51v's DMA moved 64 KiB with no CPU per packet). */
+        if (p && p->pos >= p->len && (s->csr[x] & CSR_DME)) {
+            bulk_pop(&s->bulk[x]);
+        }
+        udc_update_dreq(s);
         return v;
     }
     if (addr >= CR(1) && addr < CR(NEP)) {
@@ -861,18 +1000,21 @@ static void udc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         int y = (addr - CSR(0)) / 4;
         bool bulk = slot_active_bulk(s, y);
         bool in = slot_is_in(s, y);
+        /* DME takes the value of every write (drivers carry it). */
+        s->csr[y] = (s->csr[y] & ~CSR_DME) | (val & CSR_DME);
         if (val & CSR_PC) {
             s->csr[y] &= ~CSR_PC;
             if (bulk && !in) {
-                s->bulk[y].len = s->bulk[y].pos = 0; /* packet released */
+                bulk_pop(&s->bulk[y]); /* packet released */
             }
         }
         if (bulk && in && (val & CSR_SP)) {
-            s->bulk[y].ready = true;
+            in_commit(s, y);
         }
         if (bulk && (val & CSR_FEF)) {
             memset(&s->bulk[y], 0, sizeof(s->bulk[y]));
         }
+        udc_update_dreq(s);
         return;
     }
     if (addr == DR(0)) {
@@ -929,6 +1071,7 @@ static void udc_reset(DeviceState *dev)
     s->ep0_tx_len = 0;
     s->ep0_ready = false;
     memset(s->bulk, 0, sizeof(s->bulk));
+    udc_update_dreq(s);
     s->msc_iface = -1;
     s->cdc_in_ep = s->cdc_out_ep = s->msc_in_ep = s->msc_out_ep = 0;
     s->state = H_IDLE;
@@ -946,6 +1089,7 @@ static void udc_realize(DeviceState *dev, Error **errp)
                           0x1000);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
+    qdev_init_gpio_out_named(dev, s->dreq, "dreq", NEP);
     fifo8_create(&s->ep0_rx, 64);
     fifo8_create(&s->host_rx, 256);
     fifo8_create(&s->msc_rx, MSC_RX);
