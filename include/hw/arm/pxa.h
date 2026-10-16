@@ -165,6 +165,15 @@ typedef struct {
 
     /* Performance monitoring */
     uint32_t pmnc;
+    /*
+     * The cycle counter counts core clocks (retropane-os ADR-0031): the
+     * count up to ccnt_anchor, and the core clock it counts at since.
+     */
+    uint64_t ccnt_acc;
+    int64_t ccnt_anchor;
+    uint32_t core_khz;
+    /* CCSR: the multipliers latched by the last CLKCFG F write. */
+    uint32_t ccsr_lat;
 } PXA2xxState;
 
 struct PXA2xxI2SState {

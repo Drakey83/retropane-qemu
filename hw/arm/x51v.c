@@ -323,6 +323,27 @@ static void x51v_init(MachineState *machine)
         wm8750_data_req_set(DEVICE(codec), mpu->i2s->data_req, mpu->i2s);
     }
 
+    /*
+     * The clocks and core voltage as Windows Mobile leaves them for HaRET
+     * (retropane-os ADR-0031, docs/hw/probe-2026-10-11.md): 520 MHz turbo
+     * (CCCR 0x02000290, CLKCFG 0xB) and the voltage code for it on the
+     * three GPIOs that set the core regulator (GPIO3 low, GPIO4 and GPIO38
+     * high: code 0b110), all outputs. RetroPane's clock code reads both
+     * before it changes anything.
+     */
+    mpu->cm_regs[0] = 0x02000290;
+    mpu->ccsr_lat = 0x02000290;
+    mpu->clkcfg = 0xB;
+    address_space_stl_le(&address_space_memory, 0x40E00018, 1u << 4,
+                         MEMTXATTRS_UNSPECIFIED, NULL);   /* GPSR0: GPIO4 */
+    address_space_stl_le(&address_space_memory, 0x40E0001C, 1u << 6,
+                         MEMTXATTRS_UNSPECIFIED, NULL);   /* GPSR1: GPIO38 */
+    address_space_stl_le(&address_space_memory, 0x40E0000C,
+                         (1u << 3) | (1u << 4),
+                         MEMTXATTRS_UNSPECIFIED, NULL);   /* GPDR0 */
+    address_space_stl_le(&address_space_memory, 0x40E00010, 1u << 6,
+                         MEMTXATTRS_UNSPECIFIED, NULL);   /* GPDR1 */
+
     x51v_binfo.board_id = X51V_ARM_ID;
     arm_load_kernel(mpu->cpu, machine, &x51v_binfo);
 }
