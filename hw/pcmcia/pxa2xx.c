@@ -17,6 +17,7 @@
 #include "qemu/module.h"
 #include "hw/pcmcia.h"
 #include "hw/arm/pxa.h"
+#include "hw/qdev-properties.h"
 
 struct PXA2xxPCMCIAState {
     SysBusDevice parent_obj;
@@ -35,8 +36,21 @@ struct PXA2xxPCMCIAState {
      * the card doesn't answer, reads float to 0. Off only on boards that
      * call pxa2xx_pcmcia_set_power(). */
     bool off;
+    /* 32-bit accesses to common memory become two 16-bit card cycles. */
+    bool word_cycles;
 };
 
+/*
+ * The card's bus is 16 bits wide: the PXA27x memory controller splits a
+ * 32-bit access to a socket into two 16-bit card cycles, low half first
+ * (PXA27x Developer's Manual, PC Card interface). With a CF card answering
+ * its data register across 0x400-0x7FF in memory mode, a 32-bit load (or
+ * a DMA word) there brings two data words: measured byte-exact on the X51v
+ * (retropane-os rp-cftime, 2026-10-15, docs/research/storage-speed.md).
+ * Upstream passed the access to the card as one cycle: one word. The
+ * "word-cycles" property (on by default) switches the model off, for
+ * checking that a test fails without it.
+ */
 static uint64_t pxa2xx_pcmcia_common_read(void *opaque,
                 hwaddr offset, unsigned size)
 {
@@ -45,6 +59,11 @@ static uint64_t pxa2xx_pcmcia_common_read(void *opaque,
 
     if (s->slot.attached && !s->off) {
         pcc = PCMCIA_CARD_GET_CLASS(s->card);
+        if (size == 4 && s->word_cycles) {
+            uint64_t lo = pcc->common_read(s->card, offset) & 0xffff;
+            uint64_t hi = pcc->common_read(s->card, offset + 2) & 0xffff;
+            return lo | hi << 16;
+        }
         return pcc->common_read(s->card, offset);
     }
 
@@ -59,6 +78,11 @@ static void pxa2xx_pcmcia_common_write(void *opaque, hwaddr offset,
 
     if (s->slot.attached && !s->off) {
         pcc = PCMCIA_CARD_GET_CLASS(s->card);
+        if (size == 4 && s->word_cycles) {
+            pcc->common_write(s->card, offset, value & 0xffff);
+            pcc->common_write(s->card, offset + 2, (value >> 16) & 0xffff);
+            return;
+        }
         pcc->common_write(s->card, offset, value);
     }
 }
@@ -246,11 +270,24 @@ void pxa2xx_pcmcia_set_irq_cb(void *opaque, qemu_irq irq, qemu_irq cd_irq)
     s->cd_irq = cd_irq;
 }
 
+static Property pxa2xx_pcmcia_properties[] = {
+    DEFINE_PROP_BOOL("word-cycles", PXA2xxPCMCIAState, word_cycles, true),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
+static void pxa2xx_pcmcia_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    device_class_set_props(dc, pxa2xx_pcmcia_properties);
+}
+
 static const TypeInfo pxa2xx_pcmcia_type_info = {
     .name = TYPE_PXA2XX_PCMCIA,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(PXA2xxPCMCIAState),
     .instance_init = pxa2xx_pcmcia_initfn,
+    .class_init = pxa2xx_pcmcia_class_init,
 };
 
 static void pxa2xx_pcmcia_register_types(void)
