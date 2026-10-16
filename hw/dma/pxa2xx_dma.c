@@ -57,6 +57,9 @@ struct PXA2xxDMAState {
     PXA2xxDMAChannel *chan;
 
     uint8_t req[PXA2XX_DMA_NUM_REQUESTS];
+    /* Each request line's level, mapped or not (a channel follows the line
+     * DRCMR maps to it). */
+    bool req_level[PXA2XX_DMA_NUM_REQUESTS];
 
     /* Flag to avoid recursive DMA invocations.  */
     int running;
@@ -361,7 +364,28 @@ static void pxa2xx_dma_write(void *opaque, hwaddr offset,
                 hw_error("%s: Bad DMA channel %i\n",
                          __func__, (unsigned)value & DRCMR_CHLNUM);
 
-        s->req[channel] = value;
+        {
+            uint8_t old = s->req[channel];
+            s->req[channel] = value;
+            /*
+             * A channel's request is the level of the line mapped to it:
+             * a line mapped while raised requests at once, and a channel
+             * whose line is unmapped stops requesting. (Kept as a flag
+             * from the earlier mapping, a channel reused for another line
+             * ran with nothing to move: RetroPane's loader shares one
+             * channel between the USB controller's two storage
+             * endpoints, item 74.)
+             */
+            if (old & DRCMR_MAPVLD) {
+                s->chan[old & DRCMR_CHLNUM].request = 0;
+            }
+            if (value & DRCMR_MAPVLD) {
+                s->chan[value & DRCMR_CHLNUM].request = s->req_level[channel];
+                if (s->req_level[channel]) {
+                    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                }
+            }
+        }
         break;
 
     case DRQSR0:
@@ -456,6 +480,8 @@ static void pxa2xx_dma_request(void *opaque, int req_num, int on)
     if (req_num < 0 || req_num >= PXA2XX_DMA_NUM_REQUESTS)
         hw_error("%s: Bad DMA request %i\n", __func__, req_num);
 
+    s->req_level[req_num] = on;
+
     if (!(s->req[req_num] & DRCMR_MAPVLD))
         return;
     ch = s->req[req_num] & DRCMR_CHLNUM;
@@ -491,6 +517,7 @@ static void pxa2xx_dma_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
     memset(s->req, 0, sizeof(uint8_t) * PXA2XX_DMA_NUM_REQUESTS);
+    memset(s->req_level, 0, sizeof(s->req_level));
 
     qdev_init_gpio_in(dev, pxa2xx_dma_request, PXA2XX_DMA_NUM_REQUESTS);
 
