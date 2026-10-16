@@ -225,6 +225,12 @@ static void x51v_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(udc), 0, PXA27X_UDC_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(udc), 0,
                        qdev_get_gpio_in(mpu->pic, PXA27X_PIC_USBC));
+    /* Each endpoint slot's DMA request: slot x is the PXA27x's request
+     * 24 + x (endpoint 0 is 24; measured on the X51v with slots B-E). */
+    for (int x = 1; x < 24; x++) {
+        qdev_connect_gpio_out_named(udc, "dreq", x,
+                                    qdev_get_gpio_in(mpu->dma, 24 + x));
+    }
 
     pxa27x_register_keypad(mpu->kp, x51v_keymap, 0xE0);
 
