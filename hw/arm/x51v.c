@@ -28,6 +28,7 @@
 #include "hw/i2c/i2c.h"
 #include "hw/audio/wm8750.h"
 #include "sysemu/blockdev.h"
+#include "sysemu/reset.h"
 #include "exec/address-spaces.h"
 
 /* Static memory chip selects (PXA27x Developer's Manual, memory map). */
@@ -97,9 +98,18 @@ static struct arm_boot_info x51v_binfo = {
  * GPIO84 stays high (it shows slot power, measured).
  * QEMU's card answers at once: busy times are not modelled.
  *
+ * Card detect (GPIO13, low = card in) sticks at "no card" once the card
+ * has been pulled out, until a machine reset: on the device a card pushed
+ * back in was never seen there, even with the slot powered again for 1 s,
+ * while CPLD 0x04 bit 1 followed it both ways (retropane-os rp-cfdetect,
+ * 2026-10-16; a soft reset into Windows Mobile brought it back). The
+ * simplest model that fits; whether a card pushed into a powered slot
+ * clears it is unmeasured.
+ *
  * Tests pull the card out and push it back in through the "cfslot" switch:
  * `qom-set /machine/peripheral/cfslot pressed true` ejects it (GPIO13 high,
- * CPLD 0x04 bit 1 set, GPIO84 low), `false` re-inserts it; a card going
+ * CPLD 0x04 bit 1 set, GPIO84 low), `false` re-inserts it (CPLD 0x04
+ * bit 1 clear; GPIO13 stays high, above); a card going
  * into a powered slot starts from its power-on state.
  */
 typedef struct {
@@ -107,7 +117,9 @@ typedef struct {
     PCMCIACardState *card;     /* the card image, in the slot or not */
     qemu_irq ready;
     qemu_irq present;          /* to the CPLD's status register */
+    qemu_irq cd;               /* GPIO13, inverted: raised = card in */
     bool in;
+    bool cd_stuck;             /* GPIO13 "no card" since a removal */
     bool powered;
     bool held;
 } X51vCfSlot;
@@ -117,6 +129,15 @@ static void x51v_cf_update(X51vCfSlot *c)
     pxa2xx_pcmcia_set_power(c->socket, c->powered && !c->held);
     qemu_set_irq(c->ready, c->in && c->powered);
     qemu_set_irq(c->present, c->in);
+    qemu_set_irq(c->cd, c->in && !c->cd_stuck);
+}
+
+static void x51v_cf_slot_reset(void *opaque)
+{
+    X51vCfSlot *c = opaque;
+
+    c->cd_stuck = false;
+    x51v_cf_update(c);
 }
 
 static void x51v_cf_power(void *opaque, int n, int level)
@@ -151,6 +172,7 @@ static void x51v_cf_eject(void *opaque, int n, int level)
     if (level) {
         pxa2xx_pcmcia_detach(c->socket);
         c->in = false;
+        c->cd_stuck = true;
     } else {
         device_cold_reset(DEVICE(c->card));
         pxa2xx_pcmcia_attach(c->socket, c->card);
@@ -276,7 +298,7 @@ static void x51v_init(MachineState *machine)
         X51vCfSlot *slot = g_new0(X51vCfSlot, 1);
 
         slot->socket = mpu->pcmcia[1];
-        pxa2xx_pcmcia_set_irq_cb(mpu->pcmcia[1], NULL, cd);
+        slot->cd = cd;             /* the board's, not the socket's */
         qemu_irq_lower(cd);
         if (cf) {
             slot->card = dscm1xxxx_init(cf);
@@ -290,6 +312,7 @@ static void x51v_init(MachineState *machine)
         qdev_connect_gpio_out_named(cpld, "cf-reset", 0,
                                     qemu_allocate_irq(x51v_cf_reset, slot, 0));
         x51v_cf_update(slot);
+        qemu_register_reset(x51v_cf_slot_reset, slot);
 
         DeviceState *eject = qdev_new("x51v-button");
         qdev_set_id(eject, g_strdup("cfslot"), &error_fatal);
