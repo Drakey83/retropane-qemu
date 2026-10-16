@@ -39,6 +39,16 @@
  * while the packet being read has bytes left, and a packet read to its end
  * by DMA is released without the guest's PC; IN while a buffer has room.
  *
+ * The X51v's D+ pull-up is hard-wired (retropane-os docs/hw/udc.md, measured
+ * 2026-10-11 and traced on a PC 2026-10-16): once the host has enumerated
+ * the device, turning the controller off and on again is invisible to it,
+ * and it keeps the old device (`fixed-pullup`, on by default). The host
+ * sees an unplug only when the connector is driven to SE0: port 2's
+ * transceiver given to the PXA27x's USB host controller (UP2OCR.HXS) and a
+ * root-hub port reset there (named GPIO "port2-reset", wired by the x51v
+ * machine; rp-unplug run 3), or a board reset. The next time the controller
+ * is on with port 2 back on it, the host enumerates it as a new device.
+ *
  * The host is strict where the hardware is: a packet waits in its FIFO until
  * the host's next IN token (one host step), a full FIFO is sent without IPR,
  * a host-to-device request ends with the guest's zero-length status IN (IPR,
@@ -78,6 +88,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pxa27xUdcState, PXA27X_UDC)
 #define NEP         24
 
 #define UDCCR_UDE   (1 << 0)
+#define UP2OCR_HXS  (1 << 16)
 #define UDCCR_EMCE  (1 << 3)
 #define UDCCR_SMAC  (1 << 4)
 #define UDCCR_ACN_SHIFT 11
@@ -227,6 +238,10 @@ struct Pxa27xUdcState {
     /* The host accepts composite (IAD, class 0xEF) devices; off plays a
      * host that doesn't, to test a guest's fallback layout. */
     bool accept_composite;
+    /* The pull-up is hard-wired (property, on): see the top of the file. */
+    bool fixed_pullup;
+    /* The host has seen the device plugged in, and no unplug since. */
+    bool seen;
 };
 
 static void udc_update_irq(Pxa27xUdcState *s)
@@ -711,6 +726,42 @@ static void host_bridge_msc(Pxa27xUdcState *s)
     }
 }
 
+/* The controller is on and the connector is ours: a host that hasn't seen
+ * the device (first plug-in, or after an unplug) enumerates it; one that
+ * has keeps its old device and does nothing (the pull-up never went). */
+static void host_plug(Pxa27xUdcState *s)
+{
+    if (s->up2ocr & UP2OCR_HXS) {
+        return;     /* the transceiver belongs to the host controller */
+    }
+    if (s->fixed_pullup && s->seen) {
+        qemu_log_mask(LOG_UNIMP, "pxa27x-udc: controller on again, but the "
+                      "pull-up never went away: the host keeps the old "
+                      "device\n");
+        return;
+    }
+    s->seen = true;
+    s->state = H_ATTACH;
+    s->attach_steps = 0;
+    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + STEP_NS);
+}
+
+/* The host controller reset port 2 (named GPIO "port2-reset"): with the
+ * transceiver on it, that drives SE0 and the host sees an unplug. */
+static void udc_port2_reset(void *opaque, int n, int level)
+{
+    Pxa27xUdcState *s = opaque;
+
+    if (level && (s->up2ocr & UP2OCR_HXS)) {
+        s->seen = false;
+        s->state = H_IDLE;
+        s->phase = X_NONE;
+        timer_del(s->timer);
+        qemu_log_mask(LOG_UNIMP, "pxa27x-udc: SE0 on the connector: the host "
+                      "sees an unplug\n");
+    }
+}
+
 static void host_step(void *opaque)
 {
     Pxa27xUdcState *s = opaque;
@@ -962,9 +1013,7 @@ static void udc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         }
         s->udccr = (s->udccr & ~UDCCR_UDE) | (val & UDCCR_UDE);
         if (!was && (val & UDCCR_UDE)) {
-            s->state = H_ATTACH;
-            s->attach_steps = 0;
-            timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + STEP_NS);
+            host_plug(s);
         } else if (was && !(val & UDCCR_UDE)) {
             s->state = H_IDLE;
             timer_del(s->timer);
@@ -975,7 +1024,15 @@ static void udc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case UDCICR1: s->icr1 = val; udc_update_irq(s); return;
     case UDCISR0: s->isr0 &= ~val; udc_update_irq(s); return;
     case UDCISR1: s->isr1 &= ~val; udc_update_irq(s); return;
-    case UP2OCR:  s->up2ocr = val; return;
+    case UP2OCR: {
+        bool to_host = s->up2ocr & UP2OCR_HXS;
+        s->up2ocr = val;
+        /* Port 2 back on the device controller after an unplug. */
+        if (to_host && !(val & UP2OCR_HXS) && (s->udccr & UDCCR_UDE)) {
+            host_plug(s);
+        }
+        return;
+    }
     case UP3OCR:  s->up3ocr = val; return;
     }
     if (addr == CSR(0)) {
@@ -1077,6 +1134,9 @@ static void udc_reset(DeviceState *dev)
     s->state = H_IDLE;
     s->phase = X_NONE;
     s->open_step = 0;
+    /* A board reset takes the pull-up's supply away (measured: the PC saw
+     * a 14 s unplug): a fresh plug-in next time. */
+    s->seen = false;
     timer_del(s->timer);
     qemu_set_irq(s->irq, 0);
 }
@@ -1090,6 +1150,7 @@ static void udc_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
     qdev_init_gpio_out_named(dev, s->dreq, "dreq", NEP);
+    qdev_init_gpio_in_named(dev, udc_port2_reset, "port2-reset", 1);
     fifo8_create(&s->ep0_rx, 64);
     fifo8_create(&s->host_rx, 256);
     fifo8_create(&s->msc_rx, MSC_RX);
@@ -1109,6 +1170,7 @@ static Property udc_properties[] = {
     DEFINE_PROP_CHR("msc", Pxa27xUdcState, msc),
     DEFINE_PROP_BOOL("accept-composite", Pxa27xUdcState, accept_composite,
                      true),
+    DEFINE_PROP_BOOL("fixed-pullup", Pxa27xUdcState, fixed_pullup, true),
     DEFINE_PROP_END_OF_LIST(),
 };
 

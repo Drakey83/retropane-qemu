@@ -36,6 +36,9 @@
 #define X51V_CS3_2700G      0x0c000000  /* Intel 2700G: 16 MiB memory + regs */
 #define X51V_CS4_CPLD       0x10000000  /* board CPLD: power rails, LCD ID */
 #define PXA27X_UDC_BASE     0x40600000  /* USB device controller */
+#define PXA27X_UHC_BASE     0x4c000000  /* USB host controller (OHCI) */
+#define UHC_RH_PORT2        0x58        /* HcRhPortStatus, port 2 */
+#define UHC_SET_PORT_RESET  (1 << 4)
 #define PXA27X_PIC_USBC     11          /* its interrupt */
 
 /* GPIOs (retropane-os docs/hw/touch.md, from AxDroid). */
@@ -181,6 +184,70 @@ static void x51v_cf_eject(void *opaque, int n, int level)
     x51v_cf_update(c);
 }
 
+/*
+ * Port 2 of the PXA27x's USB host controller shares the USB connector's
+ * transceiver with the device controller (UP2OCR.HXS). A root-hub reset of
+ * port 2 drives SE0 on the connector, which the PC takes as an unplug
+ * (retropane-os rp-unplug run 3, 2026-10-16). QEMU's OHCI model has no
+ * connector, so its port 2 status register is watched here: every access
+ * goes on to the OHCI model, and a "set port reset" also pulses the device
+ * controller's "port2-reset" line (it acts only while HXS gives port 2 to
+ * the host controller).
+ */
+typedef struct X51vUhcTap {
+    MemoryRegion mr;
+    MemoryRegion *ohci;
+    qemu_irq port2_reset;
+} X51vUhcTap;
+
+static uint64_t uhc_tap_read(void *opaque, hwaddr addr, unsigned size)
+{
+    X51vUhcTap *t = opaque;
+    uint64_t v = 0;
+
+    memory_region_dispatch_read(t->ohci, UHC_RH_PORT2 + addr, &v,
+                                size_memop(size) | MO_TE,
+                                MEMTXATTRS_UNSPECIFIED);
+    return v;
+}
+
+static void uhc_tap_write(void *opaque, hwaddr addr, uint64_t val,
+                          unsigned size)
+{
+    X51vUhcTap *t = opaque;
+
+    memory_region_dispatch_write(t->ohci, UHC_RH_PORT2 + addr, val,
+                                 size_memop(size) | MO_TE,
+                                 MEMTXATTRS_UNSPECIFIED);
+    if (addr == 0 && (val & UHC_SET_PORT_RESET)) {
+        qemu_irq_pulse(t->port2_reset);
+    }
+}
+
+static const MemoryRegionOps uhc_tap_ops = {
+    .read = uhc_tap_read,
+    .write = uhc_tap_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+static void x51v_tap_uhc_port2(DeviceState *udc)
+{
+    X51vUhcTap *t = g_new0(X51vUhcTap, 1);
+    MemoryRegionSection sec = memory_region_find(get_system_memory(),
+                                                 PXA27X_UHC_BASE, 4);
+
+    if (!sec.mr) {
+        return;
+    }
+    t->ohci = sec.mr;   /* the reference is kept for the machine's life */
+    t->port2_reset = qdev_get_gpio_in_named(udc, "port2-reset", 0);
+    memory_region_init_io(&t->mr, NULL, &uhc_tap_ops, t, "x51v-uhc-port2", 4);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        PXA27X_UHC_BASE + UHC_RH_PORT2,
+                                        &t->mr, 1);
+}
+
 static void x51v_init(MachineState *machine)
 {
     PXA2xxState *mpu;
@@ -254,6 +321,7 @@ static void x51v_init(MachineState *machine)
         qdev_connect_gpio_out_named(udc, "dreq", x,
                                     qdev_get_gpio_in(mpu->dma, 24 + x));
     }
+    x51v_tap_uhc_port2(udc);
 
     pxa27x_register_keypad(mpu->kp, x51v_keymap, 0xE0);
 
