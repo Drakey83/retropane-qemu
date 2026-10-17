@@ -139,20 +139,36 @@ static inline int pxa2xx_timer_has_tm4(PXA2xxTimerInfo *s)
     return s->flags & (1 << PXA2XX_TIMER_HAVE_TM4);
 }
 
-static void pxa2xx_timer_update(void *opaque, uint64_t now_qemu)
+/*
+ * Schedules match register `i` alone. Each match is its own equality
+ * compare on the chip: writing one OSMR must not move another's deadline.
+ * Rescheduling all four on every OSMR write did: a match whose time had
+ * just come, its callback not yet run, was recomputed as (value - now)
+ * wrapped to 2^32 ticks, 22 minutes away, and was lost (retropane-os,
+ * 2026-10-17: the loader feeding the watchdog, OSMR3, in its waiting loop
+ * lost the OSMR1 tick after an image returned and slept until the watchdog
+ * reset it).
+ */
+static void pxa2xx_timer_update_one(void *opaque, uint64_t now_qemu, int i)
 {
     PXA2xxTimerInfo *s = (PXA2xxTimerInfo *) opaque;
-    int i;
     uint32_t now_vm;
     uint64_t new_qemu;
 
     now_vm = s->clock +
             muldiv64(now_qemu - s->lastload, s->freq, NANOSECONDS_PER_SECOND);
+    new_qemu = now_qemu + muldiv64((uint32_t) (s->timer[i].value - now_vm),
+                    NANOSECONDS_PER_SECOND, s->freq);
+    timer_mod(s->timer[i].qtimer, new_qemu);
+}
+
+/* All four matches: the counter itself changed (OSCR written, or loaded). */
+static void pxa2xx_timer_update(void *opaque, uint64_t now_qemu)
+{
+    int i;
 
     for (i = 0; i < 4; i ++) {
-        new_qemu = now_qemu + muldiv64((uint32_t) (s->timer[i].value - now_vm),
-                        NANOSECONDS_PER_SECOND, s->freq);
-        timer_mod(s->timer[i].qtimer, new_qemu);
+        pxa2xx_timer_update_one(opaque, now_qemu, i);
     }
 }
 
@@ -309,7 +325,7 @@ static void pxa2xx_timer_write(void *opaque, hwaddr offset,
         /* fall through */
     case OSMR0:
         s->timer[tm].value = value;
-        pxa2xx_timer_update(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        pxa2xx_timer_update_one(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), tm);
         break;
     case OSMR11: tm ++;
         /* fall through */
