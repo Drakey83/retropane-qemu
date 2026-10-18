@@ -1450,6 +1450,12 @@ static void pxa2xx_i2c_write(void *opaque, hwaddr addr,
     switch (addr) {
     case ICR:
         s->control = value & 0xfff7;
+        if (value & (1 << 14)) {                        /* UR: unit reset */
+            i2c_end_transfer(s->bus);
+            s->status = 0;
+            pxa2xx_i2c_update(s);
+            break;
+        }
         if ((value & (1 << 3)) && (value & (1 << 6)) &&
             (value & 3) == 3) {
             /*
@@ -1483,8 +1489,12 @@ static void pxa2xx_i2c_write(void *opaque, hwaddr addr,
                     ack = !i2c_send(s->bus, s->data);
             }
 
-            if (value & (1 << 1))			/* STOP condition */
+            if (value & (1 << 1)) {			/* STOP condition */
                 i2c_end_transfer(s->bus);
+                s->status &= ~(1 << 2);			/* clear UB */
+            } else if ((value & (1 << 0)) && ack) {
+                s->status |= 1 << 2;			/* set UB: bus held */
+            }
 
             if (ack) {
                 if (value & (1 << 0))			/* START condition */
@@ -1501,9 +1511,19 @@ static void pxa2xx_i2c_write(void *opaque, hwaddr addr,
                 s->status |= 1 << 1;			/* set ACKNAK */
             }
         }
-        if (!(value & (1 << 3)) && (value & (1 << 6)))	/* !TB and IUE */
-            if (value & (1 << 4))			/* MA */
+        if (!(value & (1 << 3)) && (value & (1 << 6)) &&	/* !TB, IUE */
+            (value & (1 << 4))) {			/* MA */
+            /*
+             * After a refused byte a master abort sends the stop; after an
+             * acknowledged one the X51v's controller keeps SCL low and
+             * stays busy until a unit reset (retropane-os rp-tone run 5,
+             * 2026-10-18).
+             */
+            if (!(s->status & (1 << 2)) || (s->status & (1 << 1))) {
                 i2c_end_transfer(s->bus);
+                s->status &= ~(1 << 2);
+            }
+        }
         pxa2xx_i2c_update(s);
         break;
 
