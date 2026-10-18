@@ -960,12 +960,24 @@ static uint32_t m3_texel(Intel2700GState *s, const uint32_t tex[3],
 
     /* Mip levels after the base, each after the larger one (version 25). */
     for (k = 0; k < level; k++) {
-        base += (side >> k) * (side >> k) * (format == 12 ? 4 : 2);
+        base += (side >> k) * (side >> k) *
+                (format == 12 ? 4 : format == 10 ? 1 : 2);
     }
 
     switch (format) {
     case 12:                            /* ARGB8888 (rp-mbx3d version 24) */
         return m3_word(s, base + 4 * m3_twiddle(x, y));
+    case 10: {
+        /*
+         * 8-bit grey (the GLES driver's GL_LUMINANCE): the byte in every
+         * channel, alpha too (rp-glesfeat L, 2026-10-18, one-value
+         * textures; the bytes' twiddled order is assumed, as 16-bit).
+         */
+        uint32_t b = base + m3_twiddle(x, y);
+        uint32_t g = m3_word(s, b & ~3u) >> (8 * (b & 3)) & 0xFF;
+
+        return m3_argb(g, g, g, g);
+    }
     case 28:                            /* PVRTC 4 bpp */
     case 16: {                          /* PVRTC 2 bpp */
         /*
@@ -1957,7 +1969,9 @@ static const VMStateDescription vmstate_i2700g = {
  * mbx-2d (from rp-v0.12.0): the MBX 2D engine is modelled; mbx-blend (from
  * rp-v0.13.0): its blending and the display's events as measured; mbx-3d
  * (from rp-v0.15.0): the 3D core's direct path; mbx-3d-irq (from rp-v0.16.0):
- * its render-done interrupt, bilinear filtering, 32-bit and PVRTC texels.
+ * its render-done interrupt, bilinear filtering, 32-bit and PVRTC texels;
+ * mbx-3d-alpha (from rp-v0.22.0): the alpha test, all eight depth modes,
+ * 8-bit grey texels (format code 10).
  */
 static bool i2700g_get_mbx_2d(Object *obj, Error **errp)
 {
@@ -1973,6 +1987,8 @@ static void i2700g_class_init(ObjectClass *klass, void *data)
     dc->vmsd = &vmstate_i2700g;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     object_class_property_add_bool(klass, "mbx-2d", i2700g_get_mbx_2d, NULL);
+    object_class_property_add_bool(klass, "mbx-3d-alpha", i2700g_get_mbx_2d,
+                                   NULL);
     object_class_property_add_bool(klass, "mbx-blend", i2700g_get_mbx_2d,
                                    NULL);
     object_class_property_add_bool(klass, "mbx-3d", i2700g_get_mbx_2d, NULL);
