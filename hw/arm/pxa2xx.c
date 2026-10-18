@@ -1466,8 +1466,7 @@ static void pxa2xx_i2c_write(void *opaque, hwaddr addr,
              * ends it.
              */
             qemu_log_mask(LOG_GUEST_ERROR, "pxa2xx_i2c: START and STOP on"
-                          " one byte never finishes
-");
+                          " one byte never finishes\n");
             pxa2xx_i2c_update(s);
             break;
         }
