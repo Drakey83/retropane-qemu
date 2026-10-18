@@ -178,6 +178,7 @@ typedef struct {
 
 struct PXA2xxI2SState {
     MemoryRegion iomem;
+    int64_t off_ns;     /* when ENB last went 1 -> 0 (virtual clock) */
     qemu_irq irq;
     qemu_irq rx_dma;
     qemu_irq tx_dma;

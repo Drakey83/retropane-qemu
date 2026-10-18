@@ -517,6 +517,10 @@ static void x51v_machine_init(MachineClass *mc)
                                    x51v_get_codec_gate, NULL);
     object_class_property_set_description(OBJECT_CLASS(mc), "codec-gate",
         "WM8750 I2C gate on GPIO82, headphone jack on GPIO96 (read-only)");
+    object_class_property_add_bool(OBJECT_CLASS(mc), "i2s-restart",
+                                   x51v_get_codec_gate, NULL);
+    object_class_property_set_description(OBJECT_CLASS(mc), "i2s-restart",
+        "an I2S switch-on within 645 ms of a switch-off is dropped (read-only)");
     object_class_property_add_bool(OBJECT_CLASS(mc), "i2c-start-stop",
                                    x51v_get_codec_gate, NULL);
     object_class_property_set_description(OBJECT_CLASS(mc), "i2c-start-stop",

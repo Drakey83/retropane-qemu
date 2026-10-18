@@ -1761,6 +1761,21 @@ static void pxa2xx_i2s_write(void *opaque, hwaddr addr,
 
     switch (addr) {
     case SACR0:
+        /*
+         * A switch-on within ~645 ms of a switch-off is dropped whole: the
+         * X51v's SACR0 reads 0 after it and nothing is sent (retropane-os
+         * rp-tone RP_TONE_I2S_GAPS, 2026-10-18).
+         */
+        if ((value & 1) && !s->enable && s->off_ns &&
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->off_ns <
+            645 * SCALE_MS) {
+            qemu_log_mask(LOG_GUEST_ERROR, "pxa2xx_i2s: switched on within"
+                          " 645 ms of a switch-off: ignored\n");
+            break;
+        }
+        if (s->enable && !(value & 1)) {
+            s->off_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        }
         if (value & (1 << 3))				/* RST */
             pxa2xx_i2s_reset(s);
         s->control[0] = value & 0xff3d;
