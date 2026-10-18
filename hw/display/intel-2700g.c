@@ -793,8 +793,11 @@ static void i2700g_ev_tick(void *opaque)
  * twiddled, point sampled, TEX0 bits 15-13 the format, 27-24/23-20 the
  * sides, 31-28 the address modes (wrap, mirror, clamp); TSP bit 13 blends
  * with the factors in bits 31-26 (each term value x factor >> 8, alpha
- * factors a and 256 - a); TSP bits 11-9 compare depth (larger z nearer;
- * "greater", "greater or equal", "always"), bit 7 set = no write; each
+ * factors a and 256 - a); TSP bits 11-9 compare depth in GL order (all
+ * eight, "less" passing a smaller z: rp-glesfeat D, 2026-10-18), bit 7
+ * set = no write; the object's first word is the alpha test (bits 31-29
+ * the compare in GL order, 28-21 the reference: rp-glesfeat A), a pixel
+ * failing it neither drawn nor writing depth; each
  * tile's depth starts at 0x6DC as a float if its bit 0 is set, else
  * undefined (no compare passes but "always"). Render done (status bit 2)
  * comes ~10 us + 5.25 us a tile + a quad's cost a tile later (fitted to
@@ -806,8 +809,8 @@ static void i2700g_ev_tick(void *opaque)
  * Gouraud and modulate rounding, both windings drawn, 0x654/0x658 not
  * clipping. The core keeps its state across the 3D clock off (T9, measured:
  * rp-mbx3d-api run 4).
- * "Less" and "less or equal" never passed on the device (and hid objects
- * in partial renders, not modelled): here they never pass. Not modelled:
+ * (Version 23's "less never passes" was the depth mode written into the
+ * alpha-test bits: an alpha test "alpha < 0".) Not modelled:
  * the tile accelerator, the interrupt line (render done never edged
  * GPIO85), filtering, depth across renders (0x674).
  */
@@ -834,6 +837,7 @@ typedef struct M3Vertex {
 } M3Vertex;
 
 typedef struct M3Obj {
+    uint32_t isp;                   /* the alpha test: 31-29, 28-21 */
     uint32_t tsp;
     bool textured;
     uint32_t tex[3];
@@ -871,6 +875,7 @@ static void m3_object(Intel2700GState *s, uint32_t at, bool textured,
     int k;
 
     o->textured = textured;
+    o->isp = m3_word(s, at);
     if (textured) {
         o->tsp = m3_word(s, at + 4 * 4);
         for (k = 0; k < 3; k++) {
@@ -1152,6 +1157,29 @@ static uint32_t m3_mip_level(const M3Obj *o, double x, double y, double area)
     return MIN(level, top);
 }
 
+/* A compare in GL order: never, <, ==, <=, >, !=, >=, always. */
+static bool m3_compare(uint32_t mode, double a, double b)
+{
+    switch (mode & 7) {
+    case 0:
+        return false;
+    case 1:
+        return a < b;
+    case 2:
+        return a == b;
+    case 3:
+        return a <= b;
+    case 4:
+        return a > b;
+    case 5:
+        return a != b;
+    case 6:
+        return a >= b;
+    default:
+        return true;
+    }
+}
+
 static void m3_draw(Intel2700GState *s, const M3Obj *o, M3Tile *t)
 {
     const M3Vertex *v = o->v;
@@ -1166,7 +1194,7 @@ static void m3_draw(Intel2700GState *s, const M3Obj *o, M3Tile *t)
     for (py = 0; py < M3_TILE_H; py++) {
         for (px = 0; px < M3_TILE_W; px++) {
             double x = t->x + px + 0.5, y = t->y + py + 0.5, w[3], z;
-            bool inside = true, pass;
+            bool inside = true;
             int k = py * M3_TILE_W + px;
             uint32_t src;
 
@@ -1183,27 +1211,7 @@ static void m3_draw(Intel2700GState *s, const M3Obj *o, M3Tile *t)
                 continue;
             }
             z = w[0] * v[0].z + w[1] * v[1].z + w[2] * v[2].z;
-            switch (mode) {
-            case 4:
-                pass = z > t->z[k];
-                break;
-            case 6:
-                pass = z >= t->z[k];
-                break;
-            case 7:
-                pass = true;
-                break;
-            case 1:
-            case 3:                     /* never passed on the device */
-                pass = false;
-                break;
-            default:
-                qemu_log_mask(LOG_UNIMP, "intel-2700g: depth mode %u never"
-                              " measured\n", mode);
-                pass = false;
-                break;
-            }
-            if (!pass) {
+            if (!m3_compare(mode, z, t->z[k])) {
                 continue;
             }
             if (o->tsp & M3_TSP_GOURAUD) {
@@ -1249,6 +1257,10 @@ static void m3_draw(Intel2700GState *s, const M3Obj *o, M3Tile *t)
                     tx |= 0xFF000000;
                 }
                 src = m3_modulate(tx, src);
+            }
+            if (!m3_compare(o->isp >> 29, src >> 24,
+                            (o->isp >> 21) & 0xFF)) {
+                continue;               /* the alpha test */
             }
             t->c[k] = m3_blend(o->tsp, src, t->c[k]);
             if (!(o->tsp & M3_TSP_NO_WRITE)) {
