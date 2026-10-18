@@ -458,8 +458,20 @@ static void x51v_init(MachineState *machine)
     arm_load_kernel(mpu->cpu, machine, &x51v_binfo);
 }
 
+/* A read-only marker for tests: this model has the codec's GPIO82 I2C gate
+ * and the GPIO96 headphone jack (low = plugged in), shown by
+ * `-M x51v,help`. */
+static bool x51v_get_codec_gate(Object *obj, Error **errp)
+{
+    return true;
+}
+
 static void x51v_machine_init(MachineClass *mc)
 {
+    object_class_property_add_bool(OBJECT_CLASS(mc), "codec-gate",
+                                   x51v_get_codec_gate, NULL);
+    object_class_property_set_description(OBJECT_CLASS(mc), "codec-gate",
+        "WM8750 I2C gate on GPIO82, headphone jack on GPIO96 (read-only)");
     mc->desc = "Dell Axim X51v (PXA270 + 2700G) for RetroPane OS";
     mc->init = x51v_init;
     mc->ignore_memory_transaction_failures = true;
