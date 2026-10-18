@@ -50,7 +50,8 @@
 #define X51V_GPIO_POWER     0   /* power button (low at rest) */
 #define X51V_GPIO_CF_DETECT 13  /* CF card detect (low = card in) */
 #define X51V_GPIO_CF_READY  84  /* CF slot powered (high) */
-#define X51V_GPIO_HP_DETECT 96  /* headphone jack (low = plugged in: Dell's wavedev.dll) */
+#define X51V_GPIO_HP_DETECT 83  /* headphone jack: high = in, with audio powered */
+#define X51V_GPIO_AUDIO_ON  96  /* reads 1 whenever audio is powered */
 #define X51V_GPIO_I2C_GATE  82  /* the codec's I2C gate (high for each transfer: Dell's wavedev.dll) */
 #define X51V_GPIO_2700G_IRQ 85  /* 2700G interrupt (low = asserted, likely) */
 #define X51V_WM8750_ADDR    0x1a /* codec on the I2C bus (Dell's wavedev.dll writes 0x1a) */
@@ -167,11 +168,50 @@ static void x51v_cf_reset(void *opaque, int n, int level)
     x51v_cf_update(c);
 }
 
-/* GPIO82 high: the codec's I2C gate open (it answers at its address). */
+/*
+ * The codec, its I2C gate, its power and the headphone jack, as measured
+ * under Windows Mobile (retropane-os rp-wmaudio, 2026-10-18): the codec
+ * answers at its address only while powered (CPLD 0x1C bit 1) and while
+ * GPIO82 (its I2C gate) is high; the jack reads on GPIO83, high = plugged
+ * in, only while audio is powered (0 otherwise, plugged or not); GPIO96
+ * reads 1 whenever audio is powered.
+ */
+typedef struct X51vAudio {
+    I2CSlave *codec;
+    qemu_irq jack_line, on_line;
+    bool powered, gate, jack_in;
+} X51vAudio;
+
+static void x51v_audio_update(X51vAudio *a)
+{
+    i2c_slave_set_address(a->codec, a->powered && a->gate ? X51V_WM8750_ADDR
+                                                          : X51V_I2C_NOBODY);
+    qemu_set_irq(a->jack_line, a->powered && a->jack_in);
+    qemu_set_irq(a->on_line, a->powered);
+}
+
 static void x51v_codec_gate(void *opaque, int n, int level)
 {
-    i2c_slave_set_address(I2C_SLAVE(opaque),
-                          level ? X51V_WM8750_ADDR : X51V_I2C_NOBODY);
+    X51vAudio *a = opaque;
+
+    a->gate = level;
+    x51v_audio_update(a);
+}
+
+static void x51v_codec_power(void *opaque, int n, int level)
+{
+    X51vAudio *a = opaque;
+
+    a->powered = level;
+    x51v_audio_update(a);
+}
+
+static void x51v_jack(void *opaque, int n, int level)
+{
+    X51vAudio *a = opaque;
+
+    a->jack_in = level;
+    x51v_audio_update(a);
 }
 
 static void x51v_cf_eject(void *opaque, int n, int level)
@@ -398,16 +438,12 @@ static void x51v_init(MachineState *machine)
                               qemu_allocate_irq(x51v_cf_eject, slot, 0));
     }
 
-    /* Headphone jack on GPIO96, a switch like the power button:
-     * `qom-set /machine/peripheral/jack pressed true` plugs headphones in,
-     * which pulls the line low (Dell's wavedev.dll reads low as plugged
-     * in, retropane-os docs/hw/audio.md). */
+    /* The headphone jack, a switch like the power button: `qom-set
+     * /machine/peripheral/jack pressed true` plugs headphones in (GPIO83
+     * high while audio is powered: x51v_audio_update). */
     DeviceState *jack = qdev_new("x51v-button");
     qdev_set_id(jack, g_strdup("jack"), &error_fatal);
     qdev_realize_and_unref(jack, NULL, &error_fatal);
-    qdev_connect_gpio_out(jack, 0,
-                          qemu_irq_invert(qdev_get_gpio_in(mpu->gpio,
-                                                           X51V_GPIO_HP_DETECT)));
 
     /* Audio: a WM8750 codec on the PXA I2C bus, fed by the I2S controller
      * (docs/research/hardware-inventory.md). `-machine audiodev=ID` picks
@@ -415,18 +451,27 @@ static void x51v_init(MachineState *machine)
      * while GPIO82 is high (Dell's driver raises it for each transfer and
      * lowers it after: a gate on the codec's I2C lines); closed, it moves
      * to an address nobody uses, so a write to 0x1a finds no device, as
-     * on the device. The speaker amplifier is not modelled. */
+     * on the device; likewise while its power (CPLD 0x1C bit 1) is off.
+     * The speaker amplifier (CPLD 0x14 bit 1) is not modelled. */
     {
         I2CSlave *codec = i2c_slave_new(TYPE_WM8750, X51V_WM8750_ADDR);
+        X51vAudio *audio = g_new0(X51vAudio, 1);
 
         if (machine->audiodev) {
             qdev_prop_set_string(DEVICE(codec), "audiodev", machine->audiodev);
         }
         i2c_slave_realize_and_unref(codec, pxa2xx_i2c_bus(mpu->i2c[0]),
                                     &error_fatal);
+        audio->codec = codec;
+        audio->jack_line = qdev_get_gpio_in(mpu->gpio, X51V_GPIO_HP_DETECT);
+        audio->on_line = qdev_get_gpio_in(mpu->gpio, X51V_GPIO_AUDIO_ON);
         qdev_connect_gpio_out(mpu->gpio, X51V_GPIO_I2C_GATE,
-                              qemu_allocate_irq(x51v_codec_gate, codec, 0));
-        i2c_slave_set_address(codec, X51V_I2C_NOBODY);
+                              qemu_allocate_irq(x51v_codec_gate, audio, 0));
+        qdev_connect_gpio_out_named(cpld, "codec-power", 0,
+                                    qemu_allocate_irq(x51v_codec_power,
+                                                      audio, 0));
+        qdev_connect_gpio_out(jack, 0, qemu_allocate_irq(x51v_jack, audio, 0));
+        x51v_audio_update(audio);
         mpu->i2s->opaque = codec;
         mpu->i2s->codec_out = wm8750_dac_dat;
         mpu->i2s->codec_in = wm8750_adc_dat;
@@ -472,6 +517,10 @@ static void x51v_machine_init(MachineClass *mc)
                                    x51v_get_codec_gate, NULL);
     object_class_property_set_description(OBJECT_CLASS(mc), "codec-gate",
         "WM8750 I2C gate on GPIO82, headphone jack on GPIO96 (read-only)");
+    object_class_property_add_bool(OBJECT_CLASS(mc), "codec-power",
+                                   x51v_get_codec_gate, NULL);
+    object_class_property_set_description(OBJECT_CLASS(mc), "codec-power",
+        "WM8750 powered by CPLD 0x1C bit 1, jack on GPIO83 (read-only)");
     mc->desc = "Dell Axim X51v (PXA270 + 2700G) for RetroPane OS";
     mc->init = x51v_init;
     mc->ignore_memory_transaction_failures = true;

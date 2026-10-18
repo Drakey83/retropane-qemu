@@ -15,8 +15,9 @@
  *   is set. A driver must keep its own shadow copy of every register.
  * - Latch bits with a modelled effect leave as GPIO outputs ("cf-power":
  *   0x16 bit 1 and 0x10 bit 12 both set; "cf-reset": 0x18 bit 1;
- *   "backlight": 0x18 bit 2). The machine wires them to the CF socket and
- *   the panel. Other bits are logged (-d unimp) and have no effect.
+ *   "backlight": 0x18 bit 2; "codec-power": 0x1C bit 1, measured under
+ *   Windows Mobile, retropane-os rp-wmaudio 2026-10-18). The machine wires
+ *   them to the CF socket, the panel and the audio codec. Other bits are logged (-d unimp) and have no effect.
  * - The latches start as Windows Mobile hands over, its shared shadow
  *   table as measured on the X51v (retropane-os rp-handover, 2026-10-16):
  *   02=00FD 10=1000 12=000F 14=0008 16=0003 18=0004 1A=0006 1C=000C,
@@ -50,6 +51,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(X51vCpldState, X51V_CPLD)
 #define CF_POWER_2      0x1000  /* 0x10 */
 #define CF_RESET        0x0002  /* 0x18 */
 #define BACKLIGHT_EN    0x0004  /* 0x18 */
+#define R_PWR1C         0x1C
+#define CODEC_POWER     0x0002  /* 0x1C: the WM8750's power (measured) */
 
 /* The latches as Windows Mobile hands over (its shadow table, measured). */
 static const uint16_t cpld_wm_latches[NREGS] = {
@@ -72,7 +75,7 @@ static const uint16_t cpld_status[NREGS] = {
     [0x14 / 2] = 0x0002,
 };
 
-enum { OUT_CF_POWER, OUT_CF_RESET, OUT_BACKLIGHT, NOUTS };
+enum { OUT_CF_POWER, OUT_CF_RESET, OUT_BACKLIGHT, OUT_CODEC_POWER, NOUTS };
 
 struct X51vCpldState {
     SysBusDevice parent_obj;
@@ -91,6 +94,8 @@ static void cpld_update_outputs(X51vCpldState *s)
     qemu_set_irq(s->out[OUT_CF_RESET], !!(s->regs[R_CTL18 / 2] & CF_RESET));
     qemu_set_irq(s->out[OUT_BACKLIGHT],
                  !!(s->regs[R_CTL18 / 2] & BACKLIGHT_EN));
+    qemu_set_irq(s->out[OUT_CODEC_POWER],
+                 !!(s->regs[R_PWR1C / 2] & CODEC_POWER));
 }
 
 static void cpld_set_cf_present(void *opaque, int n, int level)
@@ -151,6 +156,7 @@ static void cpld_realize(DeviceState *dev, Error **errp)
     qdev_init_gpio_out_named(dev, &s->out[OUT_CF_POWER], "cf-power", 1);
     qdev_init_gpio_out_named(dev, &s->out[OUT_CF_RESET], "cf-reset", 1);
     qdev_init_gpio_out_named(dev, &s->out[OUT_BACKLIGHT], "backlight", 1);
+    qdev_init_gpio_out_named(dev, &s->out[OUT_CODEC_POWER], "codec-power", 1);
 }
 
 static Property cpld_properties[] = {
