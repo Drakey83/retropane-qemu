@@ -1450,6 +1450,21 @@ static void pxa2xx_i2c_write(void *opaque, hwaddr addr,
     switch (addr) {
     case ICR:
         s->control = value & 0xfff7;
+        if ((value & (1 << 3)) && (value & (1 << 6)) &&
+            (value & 3) == 3) {
+            /*
+             * START and STOP on one byte: the X51v's controller never
+             * finishes it (no ITE, nothing on the bus; retropane-os
+             * rp-tone, 2026-10-18: address-only writes timed out every
+             * time, a START alone was answered at once). A master abort
+             * ends it.
+             */
+            qemu_log_mask(LOG_GUEST_ERROR, "pxa2xx_i2c: START and STOP on"
+                          " one byte never finishes
+");
+            pxa2xx_i2c_update(s);
+            break;
+        }
         if ((value & (1 << 3)) && (value & (1 << 6))) {	/* TB and IUE */
             /* TODO: slave mode */
             if (value & (1 << 0)) {			/* START condition */

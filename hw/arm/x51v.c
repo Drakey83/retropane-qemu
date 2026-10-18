@@ -517,6 +517,10 @@ static void x51v_machine_init(MachineClass *mc)
                                    x51v_get_codec_gate, NULL);
     object_class_property_set_description(OBJECT_CLASS(mc), "codec-gate",
         "WM8750 I2C gate on GPIO82, headphone jack on GPIO96 (read-only)");
+    object_class_property_add_bool(OBJECT_CLASS(mc), "i2c-start-stop",
+                                   x51v_get_codec_gate, NULL);
+    object_class_property_set_description(OBJECT_CLASS(mc), "i2c-start-stop",
+        "an I2C byte with START and STOP never finishes, as on the X51v (read-only)");
     object_class_property_add_bool(OBJECT_CLASS(mc), "codec-power",
                                    x51v_get_codec_gate, NULL);
     object_class_property_set_description(OBJECT_CLASS(mc), "codec-power",
