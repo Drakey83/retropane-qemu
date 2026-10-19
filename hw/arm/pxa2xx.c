@@ -1754,38 +1754,43 @@ static uint64_t pxa2xx_i2s_read(void *opaque, hwaddr addr,
 }
 
 /*
- * The link runs on the PXA's own clock whether or not a codec takes the
- * samples: on the X51v with the codec off, I2S still drains its FIFO at the
- * link's rate and the DMA feeding it moves (retropane-os rp-tone
- * RP_TONE_I2S_GAPS, 2026-10-18, no codec; docs/hw/emulator.md). A machine
- * that says when its codec pulls (codec_pulls, and
- * pxa2xx_i2s_codec_changed when that changes) gets this: while I2S is on
- * and the codec doesn't pull, this timer asks for the frames the link has
- * sent since the last tick, as the codec's own requests do, and the
- * samples are dropped. A request left unmet at the next tick is an
- * underrun (TUR), as the codec's path reports it. The timer runs only
- * then: ticking beside a pulling codec slowed the guest enough to overplay
- * a looping ring (rp-v0.27.0's emu-tone, notes 18% long).
+ * The PXA is the link's clock master: I2S drains its FIFO at the link's
+ * rate whether or not a codec takes the samples (on the X51v with the codec
+ * off the DMA feeding it still moves: retropane-os rp-tone RP_TONE_I2S_GAPS,
+ * 2026-10-18; docs/hw/emulator.md). A machine that says when its codec
+ * pulls (codec_pulls) gets this: while I2S is on, this timer asks every
+ * millisecond for the frames the link has sent since, on the virtual
+ * clock, and they go to the codec while it pulls, nowhere while it
+ * doesn't. A request left unmet at the next tick is an underrun (TUR).
+ * The codec's own requests don't pace the link: they come on the host's
+ * audio timer (every ~30 ms on a Windows PC, 2026-10-19), up to 1,110
+ * frames each, which ran the link ~25% slow and moved the DMA in bursts
+ * larger than a driver's half ring (retropane-os quality audit C16).
  */
 #define PXA2XX_I2S_FREE_TICK_NS (1 * SCALE_MS)
 
 static bool pxa2xx_i2s_free_wanted(PXA2xxI2SState *s)
 {
-    return s->codec_pulls && s->enable && !s->codec_pulls(s->pulls_opaque);
+    return s->codec_pulls && s->enable;
+}
+
+/* Whether a sample the link sends now reaches the codec. */
+static bool pxa2xx_i2s_to_codec(PXA2xxI2SState *s)
+{
+    return !s->free_running || s->codec_pulls(s->pulls_opaque);
 }
 
 static void pxa2xx_i2s_free_stop(PXA2xxI2SState *s)
 {
     timer_del(s->free_timer);
     if (s->free_running) {
-        /* What the free link asked for isn't the codec's to take. */
         s->free_running = false;
         s->tx_len = 0;
     }
     s->free_ns = 0;
 }
 
-/* The machine's codec started or stopped taking samples, or I2S switched. */
+/* I2S switched on or off, or the machine's codec changed. */
 void pxa2xx_i2s_codec_changed(PXA2xxI2SState *s)
 {
     if (!pxa2xx_i2s_free_wanted(s)) {
@@ -1821,6 +1826,11 @@ static void pxa2xx_i2s_free_tick(void *opaque)
         }
         /* The FIFO's samples go out first, then the request is the rest. */
         n = MIN((uint64_t) s->fifo_len, due);
+        if (s->codec_pulls(s->pulls_opaque)) {
+            for (int i = 0; i < n; i++) {
+                s->codec_out(s->opaque, s->fifo[i]);
+            }
+        }
         memmove(s->fifo, s->fifo + n, (s->fifo_len - n) * sizeof(s->fifo[0]));
         s->fifo_len -= n;
         s->tx_len = MIN(due - n, (uint64_t) INT_MAX);
@@ -1857,7 +1867,7 @@ static void pxa2xx_i2s_write(void *opaque, hwaddr addr,
         s->control[0] = value & 0xff3d;
         if (!s->enable && (value & 1) && s->tx_len) {	/* ENB */
             for (sample = s->fifo; s->fifo_len > 0; s->fifo_len --, sample ++)
-                if (!s->free_running)
+                if (pxa2xx_i2s_to_codec(s))
                     s->codec_out(s->opaque, *sample);
             s->status &= ~(1 << 7);			/* I2SOFF */
         }
@@ -1902,7 +1912,7 @@ static void pxa2xx_i2s_write(void *opaque, hwaddr addr,
         if (s->tx_len && s->enable) {
             s->tx_len --;
             pxa2xx_i2s_update(s);
-            if (!s->free_running)
+            if (pxa2xx_i2s_to_codec(s))
                 s->codec_out(s->opaque, value);
         } else if (s->fifo_len < 16) {
             s->fifo[s->fifo_len ++] = value;
@@ -1965,11 +1975,13 @@ static void pxa2xx_i2s_data_req(void *opaque, int tx, int rx)
     PXA2xxI2SState *s = (PXA2xxI2SState *) opaque;
     uint32_t *sample;
 
-    /* The codec asked: it paces the link (the free-running clock stops). */
+    /* The link clock paces transmit: the codec's request only receives. */
     if (s->free_running) {
-        s->free_running = false;
-        s->free_ns = 0;
-        s->tx_len = 0;
+        if (s->enable && s->rx_len)
+            s->status |= 1 << 6;		/* ROR */
+        s->rx_len = rx;
+        pxa2xx_i2s_update(s);
+        return;
     }
 
     /* Signal FIFO errors */

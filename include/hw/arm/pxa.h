@@ -199,16 +199,17 @@ struct PXA2xxI2SState {
     void (*set_rate)(void *, int);
     void *opaque;
     /*
-     * Whether the codec takes samples now (set by a machine that knows):
-     * while it doesn't, the link drains the FIFO on its own clock (the PXA
-     * is the clock master), the samples going nowhere.
+     * The link as the clock master (set by a machine that says whether its
+     * codec takes samples now): while I2S is on, the FIFO drains on the
+     * PXA's own clock at the link's rate, into the codec when it pulls,
+     * nowhere when it doesn't; the codec's requests no longer pace it.
      */
     bool (*codec_pulls)(void *);
     void *pulls_opaque;
     QEMUTimer *free_timer;
-    int64_t free_ns;            /* the free-running link's anchor, 0: none */
+    int64_t free_ns;            /* the link clock's anchor, 0: none */
     uint64_t free_granted;      /* frames it has asked for since */
-    bool free_running;          /* the link, not the codec, paces it now */
+    bool free_running;          /* the link clock paces the FIFO now */
 
     int fifo_len;
     uint32_t fifo[16];

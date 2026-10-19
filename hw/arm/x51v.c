@@ -621,6 +621,10 @@ static void x51v_machine_init(MachineClass *mc)
                                    x51v_get_codec_gate, NULL);
     object_class_property_set_description(OBJECT_CLASS(mc), "i2s-free-run",
         "I2S drains its FIFO at the link's rate with the codec off, as on the X51v (read-only)");
+    object_class_property_add_bool(OBJECT_CLASS(mc), "i2s-link-clock",
+                                   x51v_get_codec_gate, NULL);
+    object_class_property_set_description(OBJECT_CLASS(mc), "i2s-link-clock",
+        "the PXA's link clock paces I2S always (the codec's requests don't): smooth, at the measured rate on any host (read-only)");
     object_class_property_add_bool(OBJECT_CLASS(mc), "codec-power",
                                    x51v_get_codec_gate, NULL);
     object_class_property_set_description(OBJECT_CLASS(mc), "codec-power",
