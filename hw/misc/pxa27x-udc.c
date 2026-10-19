@@ -242,6 +242,12 @@ struct Pxa27xUdcState {
     bool fixed_pullup;
     /* The host has seen the device plugged in, and no unplug since. */
     bool seen;
+    /*
+     * Plug-ins the host lets pass without a word (a silent PC: retropane-os
+     * docs/hw/udc.md, "unplugged, but nobody came"); then it enumerates as
+     * usual. For checking the device's retry.
+     */
+    uint32_t ignore_plugs;
 };
 
 static void udc_update_irq(Pxa27xUdcState *s)
@@ -740,6 +746,12 @@ static void host_plug(Pxa27xUdcState *s)
                       "device\n");
         return;
     }
+    if (s->ignore_plugs > 0) {
+        s->ignore_plugs--;
+        qemu_log_mask(LOG_UNIMP, "pxa27x-udc: the host stays silent for this "
+                      "plug-in (ignore-plugs)\n");
+        return;
+    }
     s->seen = true;
     s->state = H_ATTACH;
     s->attach_steps = 0;
@@ -1171,6 +1183,7 @@ static Property udc_properties[] = {
     DEFINE_PROP_BOOL("accept-composite", Pxa27xUdcState, accept_composite,
                      true),
     DEFINE_PROP_BOOL("fixed-pullup", Pxa27xUdcState, fixed_pullup, true),
+    DEFINE_PROP_UINT32("ignore-plugs", Pxa27xUdcState, ignore_plugs, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
 

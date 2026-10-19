@@ -1806,6 +1806,13 @@ static void pxa2xx_i2s_write(void *opaque, hwaddr addr,
         pxa2xx_i2s_update(s);
         break;
     case SADIV:
+        /* Only a change of rate reaches the codec (a change re-opens its
+         * voice; the same rate again leaves it as it is). */
+        if (s->set_rate &&
+            pxa2xx_i2s_rate_hz(value & 0x007f) != pxa2xx_i2s_rate_hz(s->clk)) {
+            s->clk = value & 0x007f;
+            s->set_rate(s->opaque, pxa2xx_i2s_rate_hz(s->clk));
+        }
         s->clk = value & 0x007f;
         break;
     case SADR:
@@ -1822,6 +1829,27 @@ static void pxa2xx_i2s_write(void *opaque, hwaddr addr,
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: Bad write offset 0x%"HWADDR_PRIx"\n",
                       __func__, addr);
+    }
+}
+
+/*
+ * The frame rate each SADIV setting really gives, measured on the X51v
+ * against the OS timer (retropane-os rp-audio-s2 bench, 2026-10-19,
+ * docs/hw/audio.md): the field picks fixed settings, none exact. Every
+ * undocumented value measured (0x0B, 0x0E-0x10) acts as 0x1A; values not
+ * measured are taken the same.
+ */
+int pxa2xx_i2s_rate_hz(uint32_t sadiv)
+{
+    switch (sadiv) {
+    case 0x0c:
+        return 47795;   /* 48 kHz, -0.43% */
+    case 0x0d:
+        return 44317;   /* 44.1 kHz, +0.49% */
+    case 0x34:
+        return 10978;   /* 11.025 kHz, -0.43% */
+    default:
+        return 21959;   /* 0x1a, 22.05 kHz, -0.41% */
     }
 }
 

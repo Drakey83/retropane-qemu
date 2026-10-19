@@ -512,6 +512,10 @@ static void x51v_init(MachineState *machine)
         mpu->i2s->opaque = codec;
         mpu->i2s->codec_out = wm8750_dac_dat;
         mpu->i2s->codec_in = wm8750_adc_dat;
+        /* The PXA is the clock master: the codec plays at the link's real
+         * rate (the measured SADIV table), not its nominal one. */
+        mpu->i2s->set_rate = wm8750_set_bclk_in;
+        wm8750_set_bclk_in(codec, pxa2xx_i2s_rate_hz(mpu->i2s->clk));
         wm8750_data_req_set(DEVICE(codec), mpu->i2s->data_req, mpu->i2s);
         audio->vmid_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                          x51v_vmid_charged, audio);
@@ -526,6 +530,25 @@ static void x51v_init(MachineState *machine)
      * high: code 0b110), all outputs. RetroPane's clock code reads both
      * before it changes anything.
      */
+    /*
+     * The pin functions as Windows Mobile leaves them (GAFR0L-GAFR3U,
+     * retropane-os docs/hw/probe-2026-10-11.md), and the GPIO block
+     * honouring them: a pin RetroPane drives as a GPIO must be switched to
+     * function 0 first, as on the X51v (GPIO24, the TSC2046's select, is
+     * SSP1's frame until then).
+     */
+    static const uint32_t wm_gafr[8] = {
+        0x00140000, 0x001A851A, 0x6990000A, 0x0005A0AA,
+        0xA0000000, 0x01500002, 0x5409953C, 0x00001401,
+    };
+    static const hwaddr gafr_at[8] = {
+        0x054, 0x058, 0x05C, 0x060, 0x064, 0x068, 0x06C, 0x070,
+    };
+    for (int i = 0; i < 8; i++) {
+        address_space_stl_le(&address_space_memory, 0x40E00000 + gafr_at[i],
+                             wm_gafr[i], MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+    pxa2xx_gpio_alt_functions(mpu->gpio);
     mpu->cm_regs[0] = 0x02000290;
     mpu->ccsr_lat = 0x02000290;
     mpu->clkcfg = 0xB;
@@ -569,6 +592,14 @@ static void x51v_machine_init(MachineClass *mc)
                                    x51v_get_codec_gate, NULL);
     object_class_property_set_description(OBJECT_CLASS(mc), "jack-vmid",
         "the jack line (GPIO83) valid only once the codec's VMID has charged (read-only)");
+    object_class_property_add_bool(OBJECT_CLASS(mc), "gpio-functions",
+                                   x51v_get_codec_gate, NULL);
+    object_class_property_set_description(OBJECT_CLASS(mc), "gpio-functions",
+        "a pin outside its GPIO function (GAFR) doesn't drive the board; WM's GAFR at start (read-only)");
+    object_class_property_add_bool(OBJECT_CLASS(mc), "i2s-rates",
+                                   x51v_get_codec_gate, NULL);
+    object_class_property_set_description(OBJECT_CLASS(mc), "i2s-rates",
+        "the link runs at each SADIV setting's measured rate (44.1 kHz: 44,317) (read-only)");
     object_class_property_add_bool(OBJECT_CLASS(mc), "codec-power",
                                    x51v_get_codec_gate, NULL);
     object_class_property_set_description(OBJECT_CLASS(mc), "codec-power",

@@ -75,6 +75,7 @@ DeviceState *pxa2xx_pic_init(hwaddr base, ARMCPU *cpu);
 DeviceState *pxa2xx_gpio_init(hwaddr base,
                               ARMCPU *cpu, DeviceState *pic, int lines);
 void pxa2xx_gpio_read_notifier(DeviceState *dev, qemu_irq handler);
+void pxa2xx_gpio_alt_functions(DeviceState *dev);
 
 /* pxa2xx_dma.c */
 DeviceState *pxa255_dma_init(hwaddr base, qemu_irq irq);
@@ -194,6 +195,8 @@ struct PXA2xxI2SState {
     int tx_len;
     void (*codec_out)(void *, uint32_t);
     uint32_t (*codec_in)(void *);
+    /* Told the link's real rate (Hz) whenever SADIV is written. */
+    void (*set_rate)(void *, int);
     void *opaque;
 
     int fifo_len;
@@ -203,6 +206,7 @@ struct PXA2xxI2SState {
 # define PA_FMT			"0x%08lx"
 
 PXA2xxState *pxa270_init(unsigned int sdram_size, const char *revision);
+int pxa2xx_i2s_rate_hz(uint32_t sadiv);
 PXA2xxState *pxa255_init(unsigned int sdram_size);
 
 #endif /* PXA_H */

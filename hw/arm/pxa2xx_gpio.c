@@ -42,6 +42,14 @@ struct PXA2xxGPIOInfo {
     uint32_t falling[PXA2XX_GPIO_BANKS];
     uint32_t status[PXA2XX_GPIO_BANKS];
     uint32_t gafr[PXA2XX_GPIO_BANKS * 2];
+    /*
+     * Pin functions (the X51v machine): a pin whose GAFR field isn't 0
+     * belongs to its peripheral, so its GPIO output doesn't reach the
+     * board; its line idles high. On the X51v, GPIO24 left as SSP1's frame
+     * (function 2, as Windows Mobile leaves it) never selects the TSC2046
+     * (retropane-os docs/hw/touch.md, 2026-10-13).
+     */
+    bool alt_functions;
 
     uint32_t prev_level[PXA2XX_GPIO_BANKS];
     qemu_irq handler[PXA2XX_GPIO_BANKS * 32];
@@ -135,11 +143,30 @@ static void pxa2xx_gpio_set(void *opaque, int line, int level)
     }
 }
 
+/* The bank's pins in their GPIO function (GAFR field 0). */
+static uint32_t pxa2xx_gpio_plain(PXA2xxGPIOInfo *s, int bank)
+{
+    uint32_t plain = 0;
+    int pin;
+
+    if (!s->alt_functions) {
+        return ~0u;
+    }
+    for (pin = 0; pin < 32; pin++) {
+        uint32_t reg = s->gafr[bank * 2 + (pin >> 4)];
+        if (((reg >> ((pin & 15) * 2)) & 3) == 0) {
+            plain |= 1u << pin;
+        }
+    }
+    return plain;
+}
+
 static void pxa2xx_gpio_handler_update(PXA2xxGPIOInfo *s) {
-    uint32_t level, diff;
+    uint32_t level, diff, plain;
     int i, bit, line;
     for (i = 0; i < PXA2XX_GPIO_BANKS; i ++) {
-        level = s->olevel[i] & s->dir[i];
+        plain = pxa2xx_gpio_plain(s, i);
+        level = (s->olevel[i] & s->dir[i] & plain) | ~plain;
 
         for (diff = s->prev_level[i] ^ level; diff; diff ^= 1 << bit) {
             bit = ctz32(diff);
@@ -239,10 +266,12 @@ static void pxa2xx_gpio_write(void *opaque, hwaddr offset,
 
     case GAFR_L:	/* GPIO Alternate Function registers */
         s->gafr[bank * 2] = value;
+        pxa2xx_gpio_handler_update(s);
         break;
 
     case GAFR_U:	/* GPIO Alternate Function registers */
         s->gafr[bank * 2 + 1] = value;
+        pxa2xx_gpio_handler_update(s);
         break;
 
     case GEDR:		/* GPIO Edge Detect Status registers */
@@ -309,6 +338,15 @@ static void pxa2xx_gpio_realize(DeviceState *dev, Error **errp)
  * Registers a callback to notify on GPLR reads.  This normally
  * shouldn't be needed but it is used for the hack on Spitz machines.
  */
+/* Pin functions on (see `alt_functions`): set by the X51v machine. */
+void pxa2xx_gpio_alt_functions(DeviceState *dev)
+{
+    PXA2xxGPIOInfo *s = PXA2XX_GPIO(dev);
+
+    s->alt_functions = true;
+    pxa2xx_gpio_handler_update(s);
+}
+
 void pxa2xx_gpio_read_notifier(DeviceState *dev, qemu_irq handler)
 {
     PXA2xxGPIOInfo *s = PXA2XX_GPIO(dev);
