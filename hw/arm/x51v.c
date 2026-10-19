@@ -231,6 +231,14 @@ static void x51v_vmid(void *opaque, int vmidsel)
     x51v_audio_update(a);
 }
 
+/* The codec takes samples only while powered and set up (VMID, VREF). */
+static bool x51v_codec_pulls(void *opaque)
+{
+    X51vAudio *a = opaque;
+
+    return a->powered && wm8750_dac_active(a->codec);
+}
+
 static void x51v_codec_power(void *opaque, int n, int level)
 {
     X51vAudio *a = opaque;
@@ -517,6 +525,9 @@ static void x51v_init(MachineState *machine)
         mpu->i2s->set_rate = wm8750_set_bclk_in;
         wm8750_set_bclk_in(codec, pxa2xx_i2s_rate_hz(mpu->i2s->clk));
         wm8750_data_req_set(DEVICE(codec), mpu->i2s->data_req, mpu->i2s);
+        /* With the codec off the link still runs on the PXA's clock. */
+        mpu->i2s->codec_pulls = x51v_codec_pulls;
+        mpu->i2s->pulls_opaque = audio;
         audio->vmid_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                          x51v_vmid_charged, audio);
         wm8750_vmid_notify_set(DEVICE(codec), x51v_vmid, audio);
@@ -600,6 +611,10 @@ static void x51v_machine_init(MachineClass *mc)
                                    x51v_get_codec_gate, NULL);
     object_class_property_set_description(OBJECT_CLASS(mc), "i2s-rates",
         "the link runs at each SADIV setting's measured rate (44.1 kHz: 44,317) (read-only)");
+    object_class_property_add_bool(OBJECT_CLASS(mc), "i2s-free-run",
+                                   x51v_get_codec_gate, NULL);
+    object_class_property_set_description(OBJECT_CLASS(mc), "i2s-free-run",
+        "I2S drains its FIFO at the link's rate with the codec off, as on the X51v (read-only)");
     object_class_property_add_bool(OBJECT_CLASS(mc), "codec-power",
                                    x51v_get_codec_gate, NULL);
     object_class_property_set_description(OBJECT_CLASS(mc), "codec-power",

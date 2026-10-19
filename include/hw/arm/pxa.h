@@ -198,6 +198,17 @@ struct PXA2xxI2SState {
     /* Told the link's real rate (Hz) whenever SADIV is written. */
     void (*set_rate)(void *, int);
     void *opaque;
+    /*
+     * Whether the codec takes samples now (set by a machine that knows):
+     * while it doesn't, the link drains the FIFO on its own clock (the PXA
+     * is the clock master), the samples going nowhere.
+     */
+    bool (*codec_pulls)(void *);
+    void *pulls_opaque;
+    QEMUTimer *free_timer;
+    int64_t free_ns;            /* the free-running link's anchor, 0: none */
+    uint64_t free_granted;      /* frames it has asked for since */
+    bool free_running;          /* the link, not the codec, paces it now */
 
     int fifo_len;
     uint32_t fifo[16];

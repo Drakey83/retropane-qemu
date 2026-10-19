@@ -722,6 +722,14 @@ void wm8750_set_bclk_in(void *opaque, int new_hz)
     wm8750_clk_update(s, 1);
 }
 
+/* Whether the DAC takes samples (VMID and VREF on: its voice is open). */
+bool wm8750_dac_active(void *opaque)
+{
+    WM8750State *s = (WM8750State *) opaque;
+
+    return s->enable;
+}
+
 static Property wm8750_properties[] = {
     DEFINE_AUDIO_PROPERTIES(WM8750State, card),
     DEFINE_PROP_END_OF_LIST(),

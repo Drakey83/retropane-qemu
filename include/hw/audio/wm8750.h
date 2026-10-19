@@ -30,5 +30,6 @@ uint32_t wm8750_adc_dat(void *opaque);
 void *wm8750_dac_buffer(void *opaque, int samples);
 void wm8750_dac_commit(void *opaque);
 void wm8750_set_bclk_in(void *opaque, int new_hz);
+bool wm8750_dac_active(void *opaque);
 
 #endif
