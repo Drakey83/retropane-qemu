@@ -187,6 +187,7 @@ static void x51v_cf_reset(void *opaque, int n, int level)
  */
 typedef struct X51vAudio {
     I2CSlave *codec;
+    PXA2xxI2SState *i2s;
     qemu_irq jack_line, on_line;
     bool powered, gate, jack_in, vmid_ready;
     QEMUTimer *vmid_timer;
@@ -198,6 +199,10 @@ static void x51v_audio_update(X51vAudio *a)
                                                           : X51V_I2C_NOBODY);
     qemu_set_irq(a->jack_line, a->powered && a->vmid_ready && a->jack_in);
     qemu_set_irq(a->on_line, a->powered);
+    /* Power and VMID decide whether the codec takes samples. */
+    if (a->i2s) {
+        pxa2xx_i2s_codec_changed(a->i2s);
+    }
 }
 
 static void x51v_codec_gate(void *opaque, int n, int level)
@@ -528,6 +533,7 @@ static void x51v_init(MachineState *machine)
         /* With the codec off the link still runs on the PXA's clock. */
         mpu->i2s->codec_pulls = x51v_codec_pulls;
         mpu->i2s->pulls_opaque = audio;
+        audio->i2s = mpu->i2s;
         audio->vmid_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                          x51v_vmid_charged, audio);
         wm8750_vmid_notify_set(DEVICE(codec), x51v_vmid, audio);

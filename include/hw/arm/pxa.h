@@ -218,6 +218,7 @@ struct PXA2xxI2SState {
 
 PXA2xxState *pxa270_init(unsigned int sdram_size, const char *revision);
 int pxa2xx_i2s_rate_hz(uint32_t sadiv);
+void pxa2xx_i2s_codec_changed(PXA2xxI2SState *s);
 PXA2xxState *pxa255_init(unsigned int sdram_size);
 
 #endif /* PXA_H */

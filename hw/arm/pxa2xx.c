@@ -1758,17 +1758,39 @@ static uint64_t pxa2xx_i2s_read(void *opaque, hwaddr addr,
  * samples: on the X51v with the codec off, I2S still drains its FIFO at the
  * link's rate and the DMA feeding it moves (retropane-os rp-tone
  * RP_TONE_I2S_GAPS, 2026-10-18, no codec; docs/hw/emulator.md). A machine
- * that says when its codec pulls (codec_pulls) gets this: while the codec
- * doesn't, this timer asks for the frames the link has sent since the last
- * tick, as the codec's own requests do, and the samples are dropped. A
- * request left unmet at the next tick is an underrun (TUR), as the codec's
- * path reports it.
+ * that says when its codec pulls (codec_pulls, and
+ * pxa2xx_i2s_codec_changed when that changes) gets this: while I2S is on
+ * and the codec doesn't pull, this timer asks for the frames the link has
+ * sent since the last tick, as the codec's own requests do, and the
+ * samples are dropped. A request left unmet at the next tick is an
+ * underrun (TUR), as the codec's path reports it. The timer runs only
+ * then: ticking beside a pulling codec slowed the guest enough to overplay
+ * a looping ring (rp-v0.27.0's emu-tone, notes 18% long).
  */
 #define PXA2XX_I2S_FREE_TICK_NS (1 * SCALE_MS)
 
-static void pxa2xx_i2s_free_arm(PXA2xxI2SState *s)
+static bool pxa2xx_i2s_free_wanted(PXA2xxI2SState *s)
 {
-    if (s->codec_pulls && s->enable && !timer_pending(s->free_timer)) {
+    return s->codec_pulls && s->enable && !s->codec_pulls(s->pulls_opaque);
+}
+
+static void pxa2xx_i2s_free_stop(PXA2xxI2SState *s)
+{
+    timer_del(s->free_timer);
+    if (s->free_running) {
+        /* What the free link asked for isn't the codec's to take. */
+        s->free_running = false;
+        s->tx_len = 0;
+    }
+    s->free_ns = 0;
+}
+
+/* The machine's codec started or stopped taking samples, or I2S switched. */
+void pxa2xx_i2s_codec_changed(PXA2xxI2SState *s)
+{
+    if (!pxa2xx_i2s_free_wanted(s)) {
+        pxa2xx_i2s_free_stop(s);
+    } else if (!timer_pending(s->free_timer)) {
         timer_mod(s->free_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   PXA2XX_I2S_FREE_TICK_NS);
     }
@@ -1781,16 +1803,11 @@ static void pxa2xx_i2s_free_tick(void *opaque)
     uint64_t due;
     int n;
 
-    if (!s->enable) {
-        s->free_running = false;
-        s->free_ns = 0;
+    if (!pxa2xx_i2s_free_wanted(s)) {
+        pxa2xx_i2s_free_stop(s);
         return;
     }
-    if (s->codec_pulls(s->pulls_opaque)) {
-        /* The codec paces the link (its voice's requests). */
-        s->free_running = false;
-        s->free_ns = 0;
-    } else if (!s->free_ns) {
+    if (!s->free_ns) {
         s->free_running = true;
         s->free_ns = now;
         s->free_granted = 0;
@@ -1847,7 +1864,7 @@ static void pxa2xx_i2s_write(void *opaque, hwaddr addr,
         if (value & (1 << 4))				/* EFWR */
             printf("%s: Attempt to use special function\n", __func__);
         s->enable = (value & 9) == 1;			/* ENB && !RST*/
-        pxa2xx_i2s_free_arm(s);
+        pxa2xx_i2s_codec_changed(s);
         pxa2xx_i2s_update(s);
         break;
     case SACR1:
