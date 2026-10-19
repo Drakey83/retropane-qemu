@@ -40,6 +40,8 @@ struct WM8750State {
     int enable;
     void (*data_req)(void *, int, int);
     void *opaque;
+    vmid_cb *vmid_notify;
+    void *vmid_opaque;
     uint8_t data_in[4096];
     uint8_t data_out[4096];
     int idx_in, req_in;
@@ -303,6 +305,9 @@ static void wm8750_reset(I2CSlave *i2c)
     s->req_out = 0;
     wm8750_vol_update(s);
     s->i2c_len = 0;
+    if (s->vmid_notify) {
+        s->vmid_notify(s->vmid_opaque, 0);
+    }
 }
 
 static int wm8750_event(I2CSlave *i2c, enum i2c_event event)
@@ -416,6 +421,9 @@ static int wm8750_tx(I2CSlave *i2c, uint8_t data)
     case WM8750_PWR1:	/* Power Management (1) */
         s->enable = ((value >> 6) & 7) == 3;	/* VMIDSEL, VREF */
         wm8750_set_format(s);
+        if (s->vmid_notify) {
+            s->vmid_notify(s->vmid_opaque, (value >> 7) & 3);
+        }
         break;
 
     case WM8750_LINVOL:	/* Left Channel PGA */
@@ -648,6 +656,14 @@ void wm8750_data_req_set(DeviceState *dev, data_req_cb *data_req, void *opaque)
 
     s->data_req = data_req;
     s->opaque = opaque;
+}
+
+void wm8750_vmid_notify_set(DeviceState *dev, vmid_cb *cb, void *opaque)
+{
+    WM8750State *s = WM8750(dev);
+
+    s->vmid_notify = cb;
+    s->vmid_opaque = opaque;
 }
 
 void wm8750_dac_dat(void *opaque, uint32_t sample)

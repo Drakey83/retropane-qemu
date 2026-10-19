@@ -27,6 +27,7 @@
 #include "hw/pcmcia.h"
 #include "hw/i2c/i2c.h"
 #include "hw/audio/wm8750.h"
+#include "qemu/timer.h"
 #include "sysemu/blockdev.h"
 #include "sysemu/reset.h"
 #include "exec/address-spaces.h"
@@ -175,18 +176,27 @@ static void x51v_cf_reset(void *opaque, int n, int level)
  * GPIO82 (its I2C gate) is high; the jack reads on GPIO83, high = plugged
  * in, only while audio is powered (0 otherwise, plugged or not); GPIO96
  * reads 1 whenever audio is powered.
+ *
+ * And only once the codec's VMID has charged (retropane-os rp-audio-s1
+ * runs 1-2, 2026-10-18): with VMID started on its 50k divider the line
+ * read 0 with headphones in for over 1.2 s; started on the 5k fast-start
+ * divider (register 25 = 0x1C0, as Dell's driver), it read right 75 ms
+ * later. Modelled: 50 ms on 5k, 5 s on 50k (approximate: measured as
+ * more than 1.2 s and less than 19 s), 50 s on 500k; VMID off or the
+ * supply off discharges it at once.
  */
 typedef struct X51vAudio {
     I2CSlave *codec;
     qemu_irq jack_line, on_line;
-    bool powered, gate, jack_in;
+    bool powered, gate, jack_in, vmid_ready;
+    QEMUTimer *vmid_timer;
 } X51vAudio;
 
 static void x51v_audio_update(X51vAudio *a)
 {
     i2c_slave_set_address(a->codec, a->powered && a->gate ? X51V_WM8750_ADDR
                                                           : X51V_I2C_NOBODY);
-    qemu_set_irq(a->jack_line, a->powered && a->jack_in);
+    qemu_set_irq(a->jack_line, a->powered && a->vmid_ready && a->jack_in);
     qemu_set_irq(a->on_line, a->powered);
 }
 
@@ -198,11 +208,38 @@ static void x51v_codec_gate(void *opaque, int n, int level)
     x51v_audio_update(a);
 }
 
+static void x51v_vmid_charged(void *opaque)
+{
+    X51vAudio *a = opaque;
+
+    a->vmid_ready = a->powered;
+    x51v_audio_update(a);
+}
+
+static void x51v_vmid(void *opaque, int vmidsel)
+{
+    X51vAudio *a = opaque;
+    static const int64_t charge_ms[4] = { 0, 5000, 50000, 50 };
+
+    if (vmidsel == 0) {
+        a->vmid_ready = false;
+        timer_del(a->vmid_timer);
+    } else if (!a->vmid_ready) {
+        timer_mod(a->vmid_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + charge_ms[vmidsel]);
+    }
+    x51v_audio_update(a);
+}
+
 static void x51v_codec_power(void *opaque, int n, int level)
 {
     X51vAudio *a = opaque;
 
     a->powered = level;
+    if (!level) {
+        a->vmid_ready = false;
+        timer_del(a->vmid_timer);
+    }
     x51v_audio_update(a);
 }
 
@@ -476,6 +513,9 @@ static void x51v_init(MachineState *machine)
         mpu->i2s->codec_out = wm8750_dac_dat;
         mpu->i2s->codec_in = wm8750_adc_dat;
         wm8750_data_req_set(DEVICE(codec), mpu->i2s->data_req, mpu->i2s);
+        audio->vmid_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                         x51v_vmid_charged, audio);
+        wm8750_vmid_notify_set(DEVICE(codec), x51v_vmid, audio);
     }
 
     /*
@@ -525,6 +565,10 @@ static void x51v_machine_init(MachineClass *mc)
                                    x51v_get_codec_gate, NULL);
     object_class_property_set_description(OBJECT_CLASS(mc), "i2c-start-stop",
         "an I2C byte with START and STOP never finishes, as on the X51v (read-only)");
+    object_class_property_add_bool(OBJECT_CLASS(mc), "jack-vmid",
+                                   x51v_get_codec_gate, NULL);
+    object_class_property_set_description(OBJECT_CLASS(mc), "jack-vmid",
+        "the jack line (GPIO83) valid only once the codec's VMID has charged (read-only)");
     object_class_property_add_bool(OBJECT_CLASS(mc), "codec-power",
                                    x51v_get_codec_gate, NULL);
     object_class_property_set_description(OBJECT_CLASS(mc), "codec-power",
