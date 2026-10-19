@@ -534,6 +534,7 @@ static void x51v_init(MachineState *machine)
         mpu->i2s->codec_pulls = x51v_codec_pulls;
         mpu->i2s->pulls_opaque = audio;
         audio->i2s = mpu->i2s;
+        wm8750_set_pushed(DEVICE(codec), true);
         audio->vmid_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                          x51v_vmid_charged, audio);
         wm8750_vmid_notify_set(DEVICE(codec), x51v_vmid, audio);

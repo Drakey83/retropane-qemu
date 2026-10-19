@@ -46,6 +46,13 @@ struct WM8750State {
     uint8_t data_out[4096];
     int idx_in, req_in;
     int idx_out, req_out;
+    /*
+     * The link's clock master pushes samples at the link's rate
+     * (wm8750_set_pushed): they collect in data_out and go to the voice
+     * when it fills or the voice has room, not one at a time against the
+     * voice's own requests.
+     */
+    bool pushed;
 
     SWVoiceOut **out[2];
     uint8_t outvol[7], outmute[2];
@@ -98,6 +105,12 @@ static void wm8750_audio_out_cb(void *opaque, int free_b)
 {
     WM8750State *s = (WM8750State *) opaque;
 
+    if (s->pushed) {
+        /* The voice has room: what collected goes now. */
+        wm8750_out_flush(s);
+        s->data_req(s->opaque, 0, s->req_in >> 2);
+        return;
+    }
     if (s->idx_out >= free_b) {
         s->idx_out = free_b;
         s->req_out = 0;
@@ -673,8 +686,15 @@ void wm8750_dac_dat(void *opaque, uint32_t sample)
     *(uint32_t *) &s->data_out[s->idx_out] = sample;
     s->req_out -= 4;
     s->idx_out += 4;
-    if (s->idx_out >= sizeof(s->data_out) || s->req_out <= 0)
+    if (s->idx_out >= sizeof(s->data_out) || (s->req_out <= 0 && !s->pushed))
         wm8750_out_flush(s);
+}
+
+void wm8750_set_pushed(DeviceState *dev, bool pushed)
+{
+    WM8750State *s = WM8750(dev);
+
+    s->pushed = pushed;
 }
 
 void *wm8750_dac_buffer(void *opaque, int samples)
