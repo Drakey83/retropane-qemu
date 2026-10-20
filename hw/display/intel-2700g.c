@@ -132,6 +132,19 @@ enum { BLEND_NONE, BLEND_INV, BLEND_GLOB, BLEND_PIX };
 #define DEFAULT_WIDTH   480
 #define DEFAULT_HEIGHT  640
 
+#define SCAN_EVENTS     16
+
+typedef struct ScanLog {
+    int64_t frame;                  /* frames since the epoch; -1: none */
+    uint32_t start[2];              /* GSCADR, VSCADR as the frame began */
+    int n;
+    struct {
+        uint16_t line;
+        uint8_t video;
+        uint32_t val;
+    } ev[SCAN_EVENTS];
+} ScanLog;
+
 OBJECT_DECLARE_SIMPLE_TYPE(Intel2700GState, INTEL_2700G)
 
 struct Intel2700GState {
@@ -164,6 +177,14 @@ struct Intel2700GState {
     bool m3_pm_set;                 /* the memory manager was started */
     bool m3_hung;                   /* until a reset */
     QEMUTimer *m3_timer;            /* render done, for its interrupt */
+
+    /*
+     * Plane start writes in a frame, by scan line: a GSCADR or VSCADR
+     * write takes effect at once, mid-frame (retropane-os rp-gpubench W1
+     * and W4, 2026-10-19: written at line 320 and back at 560 every frame,
+     * a band showed between them). The last complete frame is drawn so.
+     */
+    ScanLog scan_cur, scan_prev;
 };
 
 /*
@@ -715,6 +736,57 @@ static int64_t i2700g_line(Intel2700GState *s)
     return (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->ev_epoch) / LINE_NS;
 }
 
+/* A plane start write, kept by the scan line it came on. */
+static void scan_note(Intel2700GState *s, bool video, uint32_t val)
+{
+    int64_t now = i2700g_line(s), frame = now / FRAME_LINES;
+    ScanLog *c = &s->scan_cur;
+
+    if (c->frame != frame) {
+        s->scan_prev = *c;
+        c->frame = frame;
+        c->start[0] = s->regs[R_GSCADR / 4];
+        c->start[1] = s->regs[R_VSCADR / 4];
+        c->n = 0;
+    }
+    if (c->n < SCAN_EVENTS) {
+        c->ev[c->n].line = now % FRAME_LINES;
+        c->ev[c->n].video = video;
+        c->ev[c->n].val = val;
+        c->n++;
+    }
+}
+
+/*
+ * The last complete frame's plane start writes, if it had any: the
+ * frame just before the one being scanned.
+ */
+static const ScanLog *scan_last(Intel2700GState *s)
+{
+    int64_t frame = i2700g_line(s) / FRAME_LINES;
+
+    if (s->scan_cur.frame == frame - 1) {
+        return &s->scan_cur;
+    }
+    if (s->scan_cur.frame == frame && s->scan_prev.frame == frame - 1) {
+        return &s->scan_prev;
+    }
+    return NULL;
+}
+
+/* A plane's start register as row `y` was scanned in `log`'s frame. */
+static uint32_t scan_value(const ScanLog *log, bool video, int y)
+{
+    uint32_t v = log->start[video];
+
+    for (int i = 0; i < log->n; i++) {
+        if (log->ev[i].video == video && log->ev[i].line < y) {
+            v = log->ev[i].val;
+        }
+    }
+    return v;
+}
+
 /* The first line after `after` (lines since the epoch) that is `vline`. */
 static int64_t i2700g_next_vline(int64_t after, uint32_t vline)
 {
@@ -910,6 +982,21 @@ static uint32_t m3_twiddle(uint32_t x, uint32_t y)
     return r;
 }
 
+/*
+ * A rectangular texture's texel order, `1 << bu` across and `1 << bv` down
+ * (retropane-os rp-gpubench G4a, 2026-10-19: 64 x 32, 32 x 64 and
+ * 512 x 1024 drew right): twiddled over the shorter side's bits, the
+ * longer side's remaining bits above them. A square is m3_twiddle.
+ */
+static uint32_t m3_twiddle_rect(uint32_t x, uint32_t y, int bu, int bv)
+{
+    int s = bu < bv ? bu : bv;
+    uint32_t mask = (1u << s) - 1;
+    uint32_t high = bu > bv ? x >> s : y >> s;
+
+    return m3_twiddle(x & mask, y & mask) | high << (2 * s);
+}
+
 static int64_t m3_address(double c, int64_t side, uint32_t mode)
 {
     int64_t i = (int64_t)floor(c * side), p;
@@ -955,25 +1042,29 @@ static uint32_t m3_texel(Intel2700GState *s, const uint32_t tex[3],
                          uint32_t level, uint32_t x, uint32_t y)
 {
     uint32_t base = (tex[1] & 0x01FFFFFF) << 7;
-    uint32_t format = (tex[0] >> 13) & 0x1F, a, t, k;
-    uint32_t side = 8u << ((tex[0] >> 24) & 15);
+    uint32_t format = (tex[0] >> 13) & 0x1F, a, t, k, i;
+    /* The two sides' codes apart (rp-gpubench G4a). */
+    int bu = 3 + ((tex[0] >> 24) & 15), bv = 3 + ((tex[0] >> 20) & 15);
 
     /* Mip levels after the base, each after the larger one (version 25). */
     for (k = 0; k < level; k++) {
-        base += (side >> k) * (side >> k) *
+        base += ((1u << bu) >> k) * ((1u << bv) >> k) *
                 (format == 12 ? 4 : format == 10 ? 1 : 2);
     }
+    bu = bu > (int)level ? bu - (int)level : 0;
+    bv = bv > (int)level ? bv - (int)level : 0;
+    i = m3_twiddle_rect(x, y, bu, bv);
 
     switch (format) {
     case 12:                            /* ARGB8888 (rp-mbx3d version 24) */
-        return m3_word(s, base + 4 * m3_twiddle(x, y));
+        return m3_word(s, base + 4 * i);
     case 10: {
         /*
          * 8-bit grey (the GLES driver's GL_LUMINANCE): the byte in every
          * channel, alpha too (rp-glesfeat L, 2026-10-18, one-value
          * textures; the bytes' twiddled order is assumed, as 16-bit).
          */
-        uint32_t b = base + m3_twiddle(x, y);
+        uint32_t b = base + i;
         uint32_t g = m3_word(s, b & ~3u) >> (8 * (b & 3)) & 0xFF;
 
         return m3_argb(g, g, g, g);
@@ -998,7 +1089,7 @@ static uint32_t m3_texel(Intel2700GState *s, const uint32_t tex[3],
                        m3_wide((c >> 4) & 15, 4), m3_wide((c >> 1) & 7, 3));
     }
     }
-    a = base + 2 * m3_twiddle(x, y);
+    a = base + 2 * i;
     t = m3_word(s, a & ~3u) >> (8 * (a & 2)) & 0xFFFF;
     switch (format) {
     case 0:                             /* ARGB1555 */
@@ -1552,6 +1643,9 @@ static MemTxResult i2700g_write(void *opaque, hwaddr addr, uint64_t val,
     if (addr == R_ID) {
         return MEMTX_OK;                /* read-only */
     }
+    if (addr == R_GSCADR || addr == R_VSCADR) {
+        scan_note(s, addr == R_VSCADR, val);
+    }
     if (i2700g_event_reg(addr)) {
         i2700g_events(s);               /* what happened before the write */
         s->regs[addr / 4] = val;
@@ -1628,10 +1722,9 @@ static int bytes_per_pixel(int fmt)
     }
 }
 
-static Plane plane_from_regs(Intel2700GState *s, bool video)
+static Plane plane_from_regs(Intel2700GState *s, bool video, uint32_t scadr)
 {
     uint32_t sctrl = s->regs[(video ? R_VSCTRL : R_GSCTRL) / 4];
-    uint32_t scadr = s->regs[(video ? R_VSCADR : R_GSCADR) / 4];
     uint32_t sadr = s->regs[(video ? R_VSADR : R_GSADR) / 4];
     uint32_t bbase = s->regs[(video ? R_VBBASE : R_GBBASE) / 4];
     uint32_t vubase = s->regs[R_VUBASE / 4];
@@ -1657,7 +1750,15 @@ static Plane plane_from_regs(Intel2700GState *s, bool video)
     uint64_t size = memory_region_size(&s->vram);
 
     p.bpp = bytes_per_pixel(p.fmt);
-    p.on = (scadr & SCADR_STR_EN) && p.bpp != 0 && video_fmt == video;
+    /*
+     * The graphics plane takes RGB formats only; the video plane takes its
+     * YUV ones and the graphics plane's RGB ones too (retropane-os
+     * rp-gpubench run D, 2026-10-19: VSCTRL 7 showed an RGB565 card
+     * exactly, 4, 5, 6 and 8 read it as ARGB4444, ARGB1555, RGB888 and
+     * ARGB8888). Codes 0-3 on the video plane (8-bit and an unnamed 16-bit
+     * reading) are not modelled: the plane stays off.
+     */
+    p.on = (scadr & SCADR_STR_EN) && p.bpp != 0 && (video || !video_fmt);
     if (video && !(s->regs[R_VOVRCLK / 4] & VOVRCLK_EN)) {
         p.on = false;                   /* the overlay's clock is off */
     }
@@ -1770,13 +1871,32 @@ static int gamma_lane(const uint32_t *t, int v, int shift)
     return lo + (hi - lo) * f / 16;
 }
 
+/* The planes on, bottom slot first; graphics before video in one slot. */
+static int plane_order(const Plane planes[2], const Plane *order[2])
+{
+    int n = 0;
+
+    for (int slot = 0; slot < 4; slot++) {
+        for (int i = 0; i < 2; i++) {
+            if (planes[i].on && planes[i].slot == slot) {
+                order[n++] = &planes[i];
+            }
+        }
+    }
+    return n;
+}
+
 static void i2700g_update(void *opaque)
 {
     Intel2700GState *s = opaque;
     bool sync = s->regs[R_DSCTRL / 4] & DSCTRL_SYNCGEN_EN;
     uint32_t dhdet = s->regs[R_DHDET / 4], dvdet = s->regs[R_DVDET / 4];
     uint32_t bg = s->regs[R_BGCOLOR / 4];
-    Plane planes[2] = { plane_from_regs(s, false), plane_from_regs(s, true) };
+    const ScanLog *log = scan_last(s);
+    uint32_t gscadr = log ? scan_value(log, false, 0) : s->regs[R_GSCADR / 4];
+    uint32_t vscadr = log ? scan_value(log, true, 0) : s->regs[R_VSCADR / 4];
+    Plane planes[2] = { plane_from_regs(s, false, gscadr),
+                        plane_from_regs(s, true, vscadr) };
     const Plane *order[2];
     int n = 0;
     int width = DEFAULT_WIDTH, height = DEFAULT_HEIGHT;
@@ -1794,14 +1914,7 @@ static void i2700g_update(void *opaque)
         width = planes[0].width;
         height = planes[0].height;
     }
-    /* Bottom slot first; graphics before video within one slot. */
-    for (int slot = 0; slot < 4; slot++) {
-        for (int i = 0; i < 2; i++) {
-            if (planes[i].on && planes[i].slot == slot) {
-                order[n++] = &planes[i];
-            }
-        }
-    }
+    n = plane_order(planes, order);
 
     DisplaySurface *surface = qemu_console_surface(s->con);
     if (!surface || surface_width(surface) != width ||
@@ -1816,6 +1929,19 @@ static void i2700g_update(void *opaque)
 
     for (int y = 0; y < height; y++) {
         uint32_t *row = (uint32_t *)(dst + y * dst_stride);
+
+        /* A plane start written mid-frame applies from its line on. */
+        if (log) {
+            uint32_t g = scan_value(log, false, y), v = scan_value(log, true, y);
+
+            if (g != gscadr || v != vscadr) {
+                gscadr = g;
+                vscadr = v;
+                planes[0] = plane_from_regs(s, false, g);
+                planes[1] = plane_from_regs(s, true, v);
+                n = plane_order(planes, order);
+            }
+        }
         for (int x = 0; x < width; x++) {
             int r = (bg >> 16) & 0xFF, g = (bg >> 8) & 0xFF, b = bg & 0xFF;
 
@@ -1904,6 +2030,8 @@ static void i2700g_reset(DeviceState *dev)
     s->m3_pm_set = s->m3_hung = false;
     s->ev_epoch = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->ev_line = 0;
+    s->scan_cur.frame = -1;
+    s->scan_prev.frame = -1;
     i2700g_irq_update(s);
 }
 
@@ -1993,6 +2121,13 @@ static void i2700g_class_init(ObjectClass *klass, void *data)
                                    NULL);
     object_class_property_add_bool(klass, "mbx-3d", i2700g_get_mbx_2d, NULL);
     object_class_property_add_bool(klass, "mbx-3d-irq", i2700g_get_mbx_2d,
+                                   NULL);
+    /* retropane-os rp-gpubench, 2026-10-19 (checks need these). */
+    object_class_property_add_bool(klass, "mbx-3d-rect", i2700g_get_mbx_2d,
+                                   NULL);
+    object_class_property_add_bool(klass, "plane-repoint", i2700g_get_mbx_2d,
+                                   NULL);
+    object_class_property_add_bool(klass, "video-rgb", i2700g_get_mbx_2d,
                                    NULL);
 }
 
