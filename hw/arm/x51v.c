@@ -356,6 +356,22 @@ static void x51v_init(MachineState *machine)
     mpu = pxa270_init(x51v_binfo.ram_size, machine->cpu_type);
 
     /*
+     * The memory controller as Windows Mobile leaves it at HaRET's hand-off
+     * (retropane-os docs/hw/probe-2026-10-11.md, the same on 2026-10-15):
+     * images start from this state on the device, and rp-cs3bus refuses to
+     * step CS3's timing from anything else. Only stored: the model's
+     * timings don't depend on them.
+     */
+    mpu->mm_regs[0x00 >> 2] = 0x0ACB2BCC;   /* MDCNFG */
+    mpu->mm_regs[0x04 >> 2] = 0x201EE030;   /* MDREFR */
+    mpu->mm_regs[0x08 >> 2] = 0x128238D8;   /* MSC0 */
+    mpu->mm_regs[0x0c >> 2] = 0x24842481;   /* MSC1: CS3 the 2700G */
+    mpu->mm_regs[0x10 >> 2] = 0x7FF47FFC;   /* MSC2 */
+    mpu->mm_regs[0x14 >> 2] = 0x00000003;   /* MECR */
+    mpu->mm_regs[0x1c >> 2] = 0x40044004;   /* SXCNFG */
+    mpu->mm_regs[0x40 >> 2] = 0x00320032;   /* MDMRS */
+
+    /*
      * The X51v's SDRAM is on SDCS2, not bank 0: Dell's OAL address table maps
      * physical 0xA8000000 (64 MiB), and HaRET boots Linux with ramaddr
      * 0xA8000000. Move the SoC's RAM there; nothing answers at 0xA0000000.
