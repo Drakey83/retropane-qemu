@@ -774,8 +774,7 @@ static void i2700g_set_pll(Intel2700GState *s, uint32_t v)
 
     if (ns == 0) {
         qemu_log_mask(LOG_UNIMP, "intel-2700g: DISPPLL 0x%x makes no clock;"
-                      " the line time is kept
-", v);
+                      " the line time is kept\n", v);
         return;
     }
     s->ev_base = i2700g_line(s);
