@@ -52,6 +52,7 @@
 #include "hw/irq.h"
 #include "qapi/error.h"
 #include "hw/sysbus.h"
+#include "hw/qdev-properties.h"
 #include "hw/display/intel-2700g.h"
 #include "ui/console.h"
 #include "ui/pixel_ops.h"
@@ -185,6 +186,14 @@ struct Intel2700GState {
      * a band showed between them). The last complete frame is drawn so.
      */
     ScanLog scan_cur, scan_prev;
+
+    /*
+     * The rp-gpubench findings, each on by default; off only for mutation
+     * checks (retropane-os emu-gpubench must fail without each).
+     */
+    bool rect;                      /* "mbx-3d-rect" */
+    bool repoint;                   /* "plane-repoint" */
+    bool video_rgb;                 /* "video-rgb" */
 };
 
 /*
@@ -1044,7 +1053,8 @@ static uint32_t m3_texel(Intel2700GState *s, const uint32_t tex[3],
     uint32_t base = (tex[1] & 0x01FFFFFF) << 7;
     uint32_t format = (tex[0] >> 13) & 0x1F, a, t, k, i;
     /* The two sides' codes apart (rp-gpubench G4a). */
-    int bu = 3 + ((tex[0] >> 24) & 15), bv = 3 + ((tex[0] >> 20) & 15);
+    int bu = 3 + ((tex[0] >> 24) & 15);
+    int bv = s->rect ? 3 + ((tex[0] >> 20) & 15) : bu;
 
     /* Mip levels after the base, each after the larger one (version 25). */
     for (k = 0; k < level; k++) {
@@ -1643,7 +1653,7 @@ static MemTxResult i2700g_write(void *opaque, hwaddr addr, uint64_t val,
     if (addr == R_ID) {
         return MEMTX_OK;                /* read-only */
     }
-    if (addr == R_GSCADR || addr == R_VSCADR) {
+    if ((addr == R_GSCADR || addr == R_VSCADR) && s->repoint) {
         scan_note(s, addr == R_VSCADR, val);
     }
     if (i2700g_event_reg(addr)) {
@@ -1758,7 +1768,8 @@ static Plane plane_from_regs(Intel2700GState *s, bool video, uint32_t scadr)
      * ARGB8888). Codes 0-3 on the video plane (8-bit and an unnamed 16-bit
      * reading) are not modelled: the plane stays off.
      */
-    p.on = (scadr & SCADR_STR_EN) && p.bpp != 0 && (video || !video_fmt);
+    p.on = (scadr & SCADR_STR_EN) && p.bpp != 0 &&
+           (video ? video_fmt || s->video_rgb : !video_fmt);
     if (video && !(s->regs[R_VOVRCLK / 4] & VOVRCLK_EN)) {
         p.on = false;                   /* the overlay's clock is off */
     }
@@ -2106,6 +2117,13 @@ static bool i2700g_get_mbx_2d(Object *obj, Error **errp)
     return true;
 }
 
+static Property i2700g_properties[] = {
+    DEFINE_PROP_BOOL("mbx-3d-rect", Intel2700GState, rect, true),
+    DEFINE_PROP_BOOL("plane-repoint", Intel2700GState, repoint, true),
+    DEFINE_PROP_BOOL("video-rgb", Intel2700GState, video_rgb, true),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
 static void i2700g_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -2122,13 +2140,7 @@ static void i2700g_class_init(ObjectClass *klass, void *data)
     object_class_property_add_bool(klass, "mbx-3d", i2700g_get_mbx_2d, NULL);
     object_class_property_add_bool(klass, "mbx-3d-irq", i2700g_get_mbx_2d,
                                    NULL);
-    /* retropane-os rp-gpubench, 2026-10-19 (checks need these). */
-    object_class_property_add_bool(klass, "mbx-3d-rect", i2700g_get_mbx_2d,
-                                   NULL);
-    object_class_property_add_bool(klass, "plane-repoint", i2700g_get_mbx_2d,
-                                   NULL);
-    object_class_property_add_bool(klass, "video-rgb", i2700g_get_mbx_2d,
-                                   NULL);
+    device_class_set_props(dc, i2700g_properties);
 }
 
 static const TypeInfo i2700g_info = {
