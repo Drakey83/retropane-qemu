@@ -65,6 +65,7 @@
 
 /* Registers (byte offsets in the register block). */
 #define R_MINTENABLE    0x0018
+#define R_DISPPLL       0x003C
 #define R_PLLSTAT       0x0040
 #define R_VOVRCLK       0x0044
 #define R_ODFBPWR       0x0064
@@ -160,7 +161,9 @@ struct Intel2700GState {
     /* The display's events: scan lines counted from the virtual clock. */
     qemu_irq irq;                   /* asserted high; GPIO85 is its inverse */
     QEMUTimer *ev_timer;
-    int64_t ev_epoch;               /* virtual ns at line 0 of frame 0 */
+    int64_t ev_epoch;               /* virtual ns at line ev_base */
+    int64_t ev_base;                /* lines since the epoch at ev_epoch */
+    int64_t line_ns;                /* a scan line, from DISPPLL */
     int64_t ev_line;                /* lines since then, events applied */
 
     /* The MBX core: its registers and the 2D engine's command parser. */
@@ -733,7 +736,8 @@ static void mbx_command(Intel2700GState *s, uint32_t w)
  * Events are applied when the registers are touched or a timer, armed only
  * for an enabled event not yet set, fires: no per-line timer otherwise.
  */
-#define LINE_NS             27460
+#define LINE_NS             27460       /* at Windows Mobile's DISPPLL */
+#define DISPPLL_WM          0xEC5
 #define FRAME_LINES         645
 #define EV_HBLNK0           (1u << 0)
 #define EV_VEVENT0          (1u << 2)
@@ -742,7 +746,41 @@ static void mbx_command(Intel2700GState *s, uint32_t w)
 
 static int64_t i2700g_line(Intel2700GState *s)
 {
-    return (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->ev_epoch) / LINE_NS;
+    return s->ev_base +
+           (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->ev_epoch) / s->line_ns;
+}
+
+/*
+ * A scan line's time at display PLL setting `v` (13 MHz x M / (N x 2^P);
+ * M bits 12-7, N 6-4, P 3-1), in proportion to Windows Mobile's 0xEC5
+ * (23.5625 MHz: 27.46 us a line, 56.46 Hz, measured). The loader moves
+ * the panel to 0xFC5, 60 Hz (retropane-os Display::adopt; display
+ * calibration C3). 0 for a setting that makes no clock.
+ */
+static int64_t line_ns_for(uint32_t v)
+{
+    int64_t m = (v >> 7) & 63, n = (v >> 4) & 7, p = (v >> 1) & 7;
+
+    if (!(v & 1) || m == 0 || n == 0) {
+        return 0;
+    }
+    return LINE_NS * 29 * (n << p) / (16 * m);
+}
+
+/* A new display clock: the line count carries on at the new pace. */
+static void i2700g_set_pll(Intel2700GState *s, uint32_t v)
+{
+    int64_t ns = line_ns_for(v);
+
+    if (ns == 0) {
+        qemu_log_mask(LOG_UNIMP, "intel-2700g: DISPPLL 0x%x makes no clock;"
+                      " the line time is kept
+", v);
+        return;
+    }
+    s->ev_base = i2700g_line(s);
+    s->ev_epoch = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->line_ns = ns;
 }
 
 /* A plane start write, kept by the scan line it came on. */
@@ -843,7 +881,8 @@ static void i2700g_irq_update(Intel2700GState *s)
         }
     }
     if (next >= 0) {
-        timer_mod(s->ev_timer, s->ev_epoch + next * LINE_NS);
+        timer_mod(s->ev_timer,
+                  s->ev_epoch + (next - s->ev_base) * s->line_ns);
     } else {
         timer_del(s->ev_timer);
     }
@@ -1653,6 +1692,13 @@ static MemTxResult i2700g_write(void *opaque, hwaddr addr, uint64_t val,
     if (addr == R_ID) {
         return MEMTX_OK;                /* read-only */
     }
+    if (addr == R_DISPPLL) {
+        i2700g_events(s);               /* what happened at the old pace */
+        i2700g_set_pll(s, val);
+        s->regs[addr / 4] = val;
+        i2700g_irq_update(s);
+        return MEMTX_OK;
+    }
     if ((addr == R_GSCADR || addr == R_VSCADR) && s->repoint) {
         scan_note(s, addr == R_VSCADR, val);
     }
@@ -2040,6 +2086,9 @@ static void i2700g_reset(DeviceState *dev)
     s->m3_done_ns = s->m3_ready_ns = M3_NONE;
     s->m3_pm_set = s->m3_hung = false;
     s->ev_epoch = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->ev_base = 0;
+    s->line_ns = LINE_NS;
+    s->regs[R_DISPPLL / 4] = DISPPLL_WM;    /* as Windows Mobile leaves it */
     s->ev_line = 0;
     s->scan_cur.frame = -1;
     s->scan_prev.frame = -1;
