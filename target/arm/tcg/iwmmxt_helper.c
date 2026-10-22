@@ -389,6 +389,14 @@ IWMMXT_OP_AVGW(1)
 
 uint64_t HELPER(iwmmxt_align)(uint64_t a, uint64_t b, uint32_t n)
 {
+    /*
+     * Offset 0 is wRn whole (retropane): the shift of b by 64 is undefined
+     * in C (x86 shifted by 0 and ORed b in). Checked on the X51v by
+     * retropane-os rp-probe wmmx_align, every offset 0-7.
+     */
+    if (n == 0) {
+        return a;
+    }
     a >>= n << 3;
     a |= b << (64 - (n << 3));
     return a;
