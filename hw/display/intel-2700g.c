@@ -174,6 +174,9 @@ struct Intel2700GState {
     uint32_t mbx_src, mbx_src_addr, mbx_origin, mbx_op;
     uint32_t mbx_clip_x, mbx_clip_y, mbx_key, mbx_keymask;
     uint32_t mbx_blend;
+    /* The 1 bpp mask for the next operation (B11): set by 0x4, 0x5, 0xE4. */
+    uint32_t mbx_mask_off, mbx_mask_size, mbx_mask_stride, mbx_mask_addr;
+    bool mbx_mask_armed;
 
     /* The 3D core (see "The MBX 3D core" below). */
     int64_t m3_done_ns;             /* render done due; INT64_MIN: none */
@@ -295,6 +298,7 @@ enum {
     MBX_XY0,
     MBX_XY1,
     MBX_SKIP,       /* drop mbx_skip words; -1: until CMD_END */
+    MBX_MASK_ADDR,  /* the mask's address after 0xE4 | stride */
 };
 
 #define OP_NO_COLOUR    (1u << 16)
@@ -504,7 +508,45 @@ static void mbx_blend(uint32_t word, const int src[4], int dst[4])
 }
 
 /* How a pixel gets from the source (or colour word) to the destination. */
-enum { MBX_SOLID, MBX_RAW, MBX_CONVERT, MBX_BLEND };
+enum { MBX_SOLID, MBX_RAW, MBX_CONVERT, MBX_BLEND, MBX_GENERAL };
+
+/* GDI's ROP3: bit (p << 2 | s << 1 | d) of `rop`, for every bit. */
+static uint32_t mbx_rop3(uint8_t rop, uint32_t p, uint32_t src, uint32_t d)
+{
+    uint32_t out = 0;
+
+    for (int k = 0; k < 32; k++) {
+        int i = ((p >> k) & 1) << 2 | ((src >> k) & 1) << 1 | ((d >> k) & 1);
+
+        out |= (uint32_t)((rop >> i) & 1) << k;
+    }
+    return out;
+}
+
+/* Whether a ROP3 reads the source (its result depends on S). */
+static bool mbx_rop_reads_source(uint8_t rop)
+{
+    return ((rop >> 2) ^ rop) & 0x33;
+}
+
+/*
+ * The mask's bit for pixel (i, j) of the rectangle: rows `stride` bytes
+ * apart, high bit first; the bit offset measured only at width 8, where
+ * offset 3 rotated each row's byte (B11): (i + offset) mod width.
+ */
+static bool mbx_mask_bit(Intel2700GState *s, uint8_t *vram, int i, int j)
+{
+    int width = (s->mbx_mask_size >> 14) & 0xFFF;
+    int b = width ? (i + (int)s->mbx_mask_off) % width : i;
+    uint32_t at = ((s->mbx_mask_addr & 0x03FFFFFC) +
+                   (uint32_t)j * s->mbx_mask_stride + (uint32_t)b / 8) &
+                  MBX_DECODE;
+
+    if (at >= INTEL_2700G_VRAM_SIZE) {
+        return false;
+    }
+    return (vram[at] >> (7 - b % 8)) & 1;
+}
 
 static void mbx_draw(Intel2700GState *s)
 {
@@ -525,12 +567,21 @@ static void mbx_draw(Intel2700GState *s)
                       " unknown format\n", s->mbx_dest);
         return;
     }
-    if ((op & 0xFFFF) != ROP_PATCOPY && (op & 0xFFFF) != ROP_SRCCOPY) {
-        qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D ROP 0x%04x\n", op & 0xFFFF);
-        return;
-    }
-    if (op & OP_ROTATE) {
-        qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D rotation 0x%08x\n", op);
+    /*
+     * Any ROP3 (retropane-os rp-mbx-blend B10, X51v 2026-10-22: all 256
+     * are GDI's with the colour word as the pattern), and a ROP4 through
+     * the 1 bpp mask armed by 0x4/0x5/0xE4 (B11: the low byte where the
+     * mask is 1, the high where 0). Both go the general way below; the
+     * mask is used by this operation only (not measured further).
+     */
+    bool masked = s->mbx_mask_armed;
+    bool general = masked || ((op & 0xFFFF) != ROP_PATCOPY &&
+                              (op & 0xFFFF) != ROP_SRCCOPY);
+
+    s->mbx_mask_armed = false;
+    if (general && (op & OP_BLEND)) {
+        qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D ROP 0x%04x with blending\n",
+                      op & 0xFFFF);
         return;
     }
     /*
@@ -548,6 +599,8 @@ static void mbx_draw(Intel2700GState *s)
                           " 0x%08x\n", s->mbx_src, dest);
             return;
         }
+    } else if (general) {
+        how = MBX_GENERAL;
     } else if ((op & 0xFFFF) != ROP_SRCCOPY) {
         how = MBX_SOLID;
     } else if (sfmt == MBX_COVERAGE4) {
@@ -577,19 +630,79 @@ static void mbx_draw(Intel2700GState *s)
      * the chip), right to left with OP_RIGHT_LEFT, reading the source as
      * it is at that moment: an overlapping copy in the wrong direction
      * smears, as it does on the chip.
+     *
+     * Rotation (bits 25-26; retropane-os rp-mbx-blend B11, X51v
+     * 2026-10-22, every pixel): the rectangle is the source's shape, w x
+     * h from (x0, y0); pixel (i, j) of it lands 1: 90 degrees clockwise
+     * at (x0 + h - 1 - j, y0 + i); 2: 180 at (x0 + w - 1 - i, y0 + h - 1
+     * - j); 3: 270 clockwise at (x0 + j, y0 + w - 1 - i). With a clip the
+     * turned pixels outside it are dropped (not measured).
      */
-    for (int j = 0; j < cy1 - cy0; j++) {
-        int y = cy0 + j;
+    int rot = (op & OP_ROTATE) >> 25;
+    int w = x1 - x0, h = y1 - y0;
 
+    if (rot) {
+        cx0 = x0, cy0 = y0, cx1 = x1, cy1 = y1;
+    }
+    for (int j = 0; j < cy1 - cy0; j++) {
         for (int i = 0; i < cx1 - cx0; i++) {
-            int x = op & OP_RIGHT_LEFT ? cx1 - 1 - i : cx0 + i;
+            int ri = op & OP_RIGHT_LEFT ? cx1 - cx0 - 1 - i : i;
+            int x = cx0 + ri, y = cy0 + j;
+            int sx = ((s->mbx_origin >> 14) & 0x1FFF) + (x - x0);
+            int sy = (s->mbx_origin & 0x1FFF) + (y - y0);
+            int ti = x - x0, tj = y - y0;    /* in the source's shape */
+
+            switch (rot) {
+            case 1:
+                x = x0 + h - 1 - tj, y = y0 + ti;
+                break;
+            case 2:
+                x = x0 + w - 1 - ti, y = y0 + h - 1 - tj;
+                break;
+            case 3:
+                x = x0 + tj, y = y0 + w - 1 - ti;
+                break;
+            }
+            if (rot && (op & OP_CLIP) &&
+                (x < (int)(s->mbx_clip_x & 0x1FFF) ||
+                 x >= (int)((s->mbx_clip_x >> 16) & 0x1FFF) ||
+                 y < (int)(s->mbx_clip_y & 0x1FFF) ||
+                 y >= (int)((s->mbx_clip_y >> 16) & 0x1FFF))) {
+                continue;
+            }
             uint8_t *p = mbx_pixel(vram, dest, s->mbx_addr, x, y);
             uint32_t v = s->mbx_colour;
 
-            if (how != MBX_SOLID) {
-                int sx = ((s->mbx_origin >> 14) & 0x1FFF) + (x - x0);
-                int sy = (s->mbx_origin & 0x1FFF) + (y - y0);
+            if (how == MBX_GENERAL) {
+                uint8_t rop = masked && !mbx_mask_bit(s, vram, ti, tj)
+                              ? (op >> 8) & 0xFF : op & 0xFF;
+                uint32_t src = 0, old = 0;
 
+                if (!p) {
+                    qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D write past the"
+                                  " end of local memory\n");
+                    return;
+                }
+                if (mbx_rop_reads_source(rop)) {
+                    src = mbx_read(vram, s->mbx_src, s->mbx_src_addr, sx, sy);
+                    if ((op & OP_KEY) &&
+                        (src & s->mbx_keymask) == s->mbx_key) {
+                        continue;
+                    }
+                    if (sfmt != dfmt && mbx_argb(sfmt, src, s->mbx_colour, c)) {
+                        mbx_pack(dfmt, c, &src);
+                    }
+                }
+                for (int k = 0; k < bpp; k++) {
+                    old |= (uint32_t)p[k] << (8 * k);
+                }
+                v = mbx_rop3(rop, s->mbx_colour, src, old);
+                for (int k = 0; k < bpp; k++) {
+                    p[k] = v >> (8 * k);
+                }
+                continue;
+            }
+            if (how != MBX_SOLID) {
                 v = mbx_read(vram, s->mbx_src, s->mbx_src_addr, sx, sy);
                 if ((op & OP_KEY) && (v & s->mbx_keymask) == s->mbx_key) {
                     continue;       /* the key colour: left as it was */
@@ -665,10 +778,23 @@ static void mbx_command(Intel2700GState *s, uint32_t w)
             s->mbx_dest = w;
             s->mbx_state = MBX_DEST_ADDR;
             return;
-        case 0xC:                       /* palettes, a mask: one address */
-        case 0xD:
+        case 0x4:                       /* mask bit offset (B11) */
+            s->mbx_mask_off = (w >> 14) & 7;
+            return;
+        case 0x5:                       /* mask width << 14 | rows (B11) */
+            s->mbx_mask_size = w & 0x0FFFFFFF;
+            return;
         case 0xE:
-            mbx_skip(s, 1, "palette or mask", w);
+            if ((w >> 24) == 0xE4) {    /* mask stride, then its address */
+                s->mbx_mask_stride = w & 0x7FFF;
+                s->mbx_state = MBX_MASK_ADDR;
+            } else {
+                mbx_skip(s, 1, "mask", w);
+            }
+            return;
+        case 0xC:                       /* palettes: one address */
+        case 0xD:
+            mbx_skip(s, 1, "palette", w);
             return;
         default:
             mbx_skip(s, -1, "command", w);
@@ -676,6 +802,10 @@ static void mbx_command(Intel2700GState *s, uint32_t w)
         }
     case MBX_DEST_ADDR:
         s->mbx_addr = w;
+        break;
+    case MBX_MASK_ADDR:
+        s->mbx_mask_addr = w;
+        s->mbx_mask_armed = true;
         break;
     case MBX_SRC_ADDR:
         s->mbx_src_addr = w;
@@ -2147,6 +2277,11 @@ static const VMStateDescription vmstate_i2700g = {
         VMSTATE_UINT32(mbx_key, Intel2700GState),
         VMSTATE_UINT32(mbx_keymask, Intel2700GState),
         VMSTATE_UINT32(mbx_blend, Intel2700GState),
+        VMSTATE_UINT32(mbx_mask_off, Intel2700GState),
+        VMSTATE_UINT32(mbx_mask_size, Intel2700GState),
+        VMSTATE_UINT32(mbx_mask_stride, Intel2700GState),
+        VMSTATE_UINT32(mbx_mask_addr, Intel2700GState),
+        VMSTATE_BOOL(mbx_mask_armed, Intel2700GState),
         VMSTATE_INT64(ev_epoch, Intel2700GState),
         VMSTATE_INT64(ev_line, Intel2700GState),
         VMSTATE_TIMER_PTR(ev_timer, Intel2700GState),
@@ -2165,7 +2300,9 @@ static const VMStateDescription vmstate_i2700g = {
  * (from rp-v0.15.0): the 3D core's direct path; mbx-3d-irq (from rp-v0.16.0):
  * its render-done interrupt, bilinear filtering, 32-bit and PVRTC texels;
  * mbx-3d-alpha (from rp-v0.22.0): the alpha test, all eight depth modes,
- * 8-bit grey texels (format code 10).
+ * 8-bit grey texels (format code 10); mbx-2d-rop (branch rp-next): every
+ * ROP3, ROP4 through a 1 bpp mask, rotation bits 25-26 (retropane-os
+ * rp-mbx-blend B10 and B11 on the X51v, 2026-10-22).
  */
 static bool i2700g_get_mbx_2d(Object *obj, Error **errp)
 {
@@ -2194,6 +2331,8 @@ static void i2700g_class_init(ObjectClass *klass, void *data)
                                    NULL);
     object_class_property_add_bool(klass, "mbx-3d", i2700g_get_mbx_2d, NULL);
     object_class_property_add_bool(klass, "mbx-3d-irq", i2700g_get_mbx_2d,
+                                   NULL);
+    object_class_property_add_bool(klass, "mbx-2d-rop", i2700g_get_mbx_2d,
                                    NULL);
     device_class_set_props(dc, i2700g_properties);
 }
