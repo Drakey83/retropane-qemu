@@ -314,9 +314,29 @@ IWMMXT_OP_CMP(maxu, uint8_t, uint16_t, uint32_t, >)
 IWMMXT_OP_CMP(subn, uint8_t, uint16_t, uint32_t, -)
 IWMMXT_OP_CMP(addn, uint8_t, uint16_t, uint32_t, +)
 #undef CMP
-/* TODO Signed- and Unsigned-Saturation */
-#define CMP(SHR, TYPE, OPER, MASK) ((uint64_t) (((TYPE) ((a >> SHR) & MASK) \
-            OPER (TYPE) ((b >> SHR) & MASK)) & MASK) << SHR)
+/*
+ * Saturating add and subtract (retropane): each lane is worked out wide and
+ * clamped to the range of its type, as the PXA270 does (retropane-os
+ * rp-probe wmmx_mix, X51v 2026-10-22: WADDHSS matched a saturating 16-bit
+ * add). The lane type's signedness picks the range. wCSSF (the sticky
+ * saturation flags) is not set (not checked on the device).
+ */
+static inline uint64_t iwmmxt_sat_lane(int64_t v, int bits, bool sign)
+{
+    int64_t lo = sign ? -(INT64_C(1) << (bits - 1)) : 0;
+    int64_t hi = sign ? (INT64_C(1) << (bits - 1)) - 1
+                      : (int64_t) ((UINT64_C(1) << bits) - 1);
+    if (v < lo) {
+        v = lo;
+    } else if (v > hi) {
+        v = hi;
+    }
+    return (uint64_t) v & ((UINT64_C(1) << bits) - 1);
+}
+#define CMP(SHR, TYPE, OPER, MASK) (iwmmxt_sat_lane( \
+            (int64_t) (TYPE) ((a >> SHR) & MASK) OPER \
+            (int64_t) (TYPE) ((b >> SHR) & MASK), \
+            (int) sizeof(TYPE) * 8, (TYPE) -1 < 0) << SHR)
 IWMMXT_OP_CMP(subu, uint8_t, uint16_t, uint32_t, -)
 IWMMXT_OP_CMP(addu, uint8_t, uint16_t, uint32_t, +)
 IWMMXT_OP_CMP(subs, int8_t, int16_t, int32_t, -)
