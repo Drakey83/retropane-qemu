@@ -177,6 +177,8 @@ struct Intel2700GState {
     /* The 1 bpp mask for the next operation (B11): set by 0x4, 0x5, 0xE4. */
     uint32_t mbx_mask_off, mbx_mask_size, mbx_mask_stride, mbx_mask_addr;
     bool mbx_mask_armed;
+    /* The source palette (0xC0000000, its address) and the scale word (B9). */
+    uint32_t mbx_pal_addr, mbx_scale;
 
     /* The 3D core (see "The MBX 3D core" below). */
     int64_t m3_done_ns;             /* render done due; INT64_MIN: none */
@@ -257,6 +259,14 @@ static bool system_block_freezes(hwaddr addr)
  */
 #define MBX_FMT(surf)       (((surf) >> 15) & 0x1F)
 #define MBX_COVERAGE4       0x5         /* 4 bpp coverage, high nibble first */
+/*
+ * Indexed sources through the source palette (retropane-os rp-mbx-blend B9,
+ * X51v 2026-10-21): 1 bpp high bit first and 8 bpp, each index a 32-bit
+ * ARGB entry at the palette's address (0xC0000000, then it). 2 and 4 bpp
+ * (codes 1, 2) not measured.
+ */
+#define MBX_INDEX1          0x0
+#define MBX_INDEX8          0x3
 #define MBX_ARGB4444        0x7
 #define MBX_XRGB1555        0x8         /* 8 and 9: 1:5:5:5, read with alpha 0 */
 #define MBX_XRGB1555_9      0x9
@@ -299,6 +309,7 @@ enum {
     MBX_XY1,
     MBX_SKIP,       /* drop mbx_skip words; -1: until CMD_END */
     MBX_MASK_ADDR,  /* the mask's address after 0xE4 | stride */
+    MBX_PAL_ADDR,   /* the source palette's address after 0xC0000000 */
 };
 
 #define OP_NO_COLOUR    (1u << 16)
@@ -367,6 +378,10 @@ static uint8_t *mbx_pixel(uint8_t *vram, uint32_t surf, uint32_t addr,
 static int mbx_src_bits(uint32_t surf)
 {
     switch (MBX_FMT(surf)) {
+    case MBX_INDEX1:
+        return 1;
+    case MBX_INDEX8:
+        return 8;
     case MBX_COVERAGE4:
         return 4;
     case MBX_ARGB4444:
@@ -398,6 +413,8 @@ static uint32_t mbx_read(uint8_t *vram, uint32_t surf, uint32_t addr,
     }
     if (bits == 4) {
         v = x & 1 ? v & 0xF : v >> 4;   /* high nibble first (measured) */
+    } else if (bits == 1) {
+        v = (v >> (7 - (x & 7))) & 1;   /* high bit first (B9, measured) */
     }
     return v;
 }
@@ -558,6 +575,20 @@ static void mbx_draw(Intel2700GState *s)
     int x1 = (s->mbx_xy1 >> 16) & 0x1FFF, y1 = s->mbx_xy1 & 0x1FFF;
     int cx0 = x0, cy0 = y0, cx1 = x1, cy1 = y1;
     int sfmt = MBX_FMT(s->mbx_src), dfmt = MBX_FMT(dest);
+    bool indexed = sfmt == MBX_INDEX1 || sfmt == MBX_INDEX8;
+    /*
+     * The scale word (B9b, X51v: nearest pixel): output pixel i of the
+     * rectangle shows source pixel (i * s) >> 5, s = 32 x src / dst: 32
+     * is 1:1, 16 doubles, 64 halves, 21 gives x1.5's 0 0 1 1 2 3 3 4 ...
+     */
+    int xs = (s->mbx_scale >> 18) & 0x3FF, ys = (s->mbx_scale >> 4) & 0x3FFF;
+
+    if (indexed) {
+        sfmt = MBX_ARGB8888;            /* what the palette gives */
+    }
+    if (!xs || !ys) {                   /* never sent: as 1:1 (reset state */
+        xs = ys = 32;                   /* not measured) */
+    }
     int c[4], d[4];
     uint32_t packed;
     int how;
@@ -579,6 +610,14 @@ static void mbx_draw(Intel2700GState *s)
                               (op & 0xFFFF) != ROP_SRCCOPY);
 
     s->mbx_mask_armed = false;
+    /*
+     * Header bit 21: the operation writes nothing (retropane-os
+     * rp-mbx-blend B7c and B10d, X51v 2026-10-21/22: copies and fills, no
+     * stray writes, no hang); what it is for is not known.
+     */
+    if (op & (1u << 21)) {
+        return;
+    }
     if (general && (op & OP_BLEND)) {
         qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D ROP 0x%04x with blending\n",
                       op & 0xFFFF);
@@ -648,8 +687,8 @@ static void mbx_draw(Intel2700GState *s)
         for (int i = 0; i < cx1 - cx0; i++) {
             int ri = op & OP_RIGHT_LEFT ? cx1 - cx0 - 1 - i : i;
             int x = cx0 + ri, y = cy0 + j;
-            int sx = ((s->mbx_origin >> 14) & 0x1FFF) + (x - x0);
-            int sy = (s->mbx_origin & 0x1FFF) + (y - y0);
+            int sx = ((s->mbx_origin >> 14) & 0x1FFF) + ((x - x0) * xs >> 5);
+            int sy = (s->mbx_origin & 0x1FFF) + ((y - y0) * ys >> 5);
             int ti = x - x0, tj = y - y0;    /* in the source's shape */
 
             switch (rot) {
@@ -704,6 +743,10 @@ static void mbx_draw(Intel2700GState *s)
             }
             if (how != MBX_SOLID) {
                 v = mbx_read(vram, s->mbx_src, s->mbx_src_addr, sx, sy);
+                if (indexed) {
+                    v = mbx_read(vram, MBX_ARGB8888 << 15, s->mbx_pal_addr,
+                                 v, 0);
+                }
                 if ((op & OP_KEY) && (v & s->mbx_keymask) == s->mbx_key) {
                     continue;       /* the key colour: left as it was */
                 }
@@ -759,10 +802,8 @@ static void mbx_command(Intel2700GState *s, uint32_t w)
         case 0x3:
             s->mbx_origin = w;
             return;
-        case 0x6:
-            if (w != SCALE_1_TO_1) {
-                qemu_log_mask(LOG_UNIMP, "intel-2700g: 2D scaling 0x%08x\n", w);
-            }
+        case 0x6:                       /* kept until replaced (B9b) */
+            s->mbx_scale = w;
             return;
         case 0x7:                       /* end of batch */
             return;
@@ -792,9 +833,11 @@ static void mbx_command(Intel2700GState *s, uint32_t w)
                 mbx_skip(s, 1, "mask", w);
             }
             return;
-        case 0xC:                       /* palettes: one address */
-        case 0xD:
-            mbx_skip(s, 1, "palette", w);
+        case 0xC:                       /* the source palette's address */
+            s->mbx_state = MBX_PAL_ADDR;
+            return;
+        case 0xD:                       /* the brush palette: not measured */
+            mbx_skip(s, 1, "brush palette", w);
             return;
         default:
             mbx_skip(s, -1, "command", w);
@@ -806,6 +849,9 @@ static void mbx_command(Intel2700GState *s, uint32_t w)
     case MBX_MASK_ADDR:
         s->mbx_mask_addr = w;
         s->mbx_mask_armed = true;
+        break;
+    case MBX_PAL_ADDR:                  /* kept until replaced (B9d) */
+        s->mbx_pal_addr = w;
         break;
     case MBX_SRC_ADDR:
         s->mbx_src_addr = w;
@@ -2282,6 +2328,8 @@ static const VMStateDescription vmstate_i2700g = {
         VMSTATE_UINT32(mbx_mask_stride, Intel2700GState),
         VMSTATE_UINT32(mbx_mask_addr, Intel2700GState),
         VMSTATE_BOOL(mbx_mask_armed, Intel2700GState),
+        VMSTATE_UINT32(mbx_pal_addr, Intel2700GState),
+        VMSTATE_UINT32(mbx_scale, Intel2700GState),
         VMSTATE_INT64(ev_epoch, Intel2700GState),
         VMSTATE_INT64(ev_line, Intel2700GState),
         VMSTATE_TIMER_PTR(ev_timer, Intel2700GState),
@@ -2302,7 +2350,9 @@ static const VMStateDescription vmstate_i2700g = {
  * mbx-3d-alpha (from rp-v0.22.0): the alpha test, all eight depth modes,
  * 8-bit grey texels (format code 10); mbx-2d-rop (branch rp-next): every
  * ROP3, ROP4 through a 1 bpp mask, rotation bits 25-26 (retropane-os
- * rp-mbx-blend B10 and B11 on the X51v, 2026-10-22).
+ * rp-mbx-blend B10 and B11 on the X51v, 2026-10-22); mbx-2d-pal (branch
+ * rp-next): 1 and 8 bpp sources through the source palette, the scale word
+ * (nearest pixel), header bit 21 writing nothing (B7, B9, B10).
  */
 static bool i2700g_get_mbx_2d(Object *obj, Error **errp)
 {
@@ -2333,6 +2383,8 @@ static void i2700g_class_init(ObjectClass *klass, void *data)
     object_class_property_add_bool(klass, "mbx-3d-irq", i2700g_get_mbx_2d,
                                    NULL);
     object_class_property_add_bool(klass, "mbx-2d-rop", i2700g_get_mbx_2d,
+                                   NULL);
+    object_class_property_add_bool(klass, "mbx-2d-pal", i2700g_get_mbx_2d,
                                    NULL);
     device_class_set_props(dc, i2700g_properties);
 }
