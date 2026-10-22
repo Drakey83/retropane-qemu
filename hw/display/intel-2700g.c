@@ -937,6 +937,12 @@ static void i2700g_ev_tick(void *opaque)
 #define M3_START            0x680
 #define M3_PM_GO            0x838
 #define M3_RENDER_DONE      (1u << 2)
+/*
+ * Set with render done on the X51v, meaning not known (retropane-os
+ * rp-gpubench run FI, 2026-10-22: 0x12c read 0x0c or 0x4c at the end of
+ * every render, enables 0 or all; the clear wipes it).
+ */
+#define M3_RENDER_DONE_B3   (1u << 3)
 #define M3_PM_READY         (1u << 6)
 #define M3_LAST             (1u << 31)
 #define M3_ADDR_MASK        0x01FFFFFCu
@@ -1534,7 +1540,7 @@ static void m3_tick(Intel2700GState *s)
 {
     if (m3_passed(s->m3_done_ns)) {
         s->m3_done_ns = M3_NONE;
-        s->mbx[MBX_STATUS / 4] |= M3_RENDER_DONE;
+        s->mbx[MBX_STATUS / 4] |= M3_RENDER_DONE | M3_RENDER_DONE_B3;
         if ((s->mbx[MBX_ENABLE / 4] & 0x8004) == 0x8004 &&
             (s->regs[R_MINTENABLE / 4] & 0x8004) == 0x8004) {
             qemu_set_irq(s->irq, 1);
@@ -1560,7 +1566,8 @@ static void m3_write(Intel2700GState *s, hwaddr off, uint32_t val)
     if (off == MBX_RESET && val == 0x111) {
         s->m3_done_ns = s->m3_ready_ns = M3_NONE;
         s->m3_pm_set = s->m3_hung = false;
-        s->mbx[MBX_STATUS / 4] &= ~(M3_RENDER_DONE | M3_PM_READY);
+        s->mbx[MBX_STATUS / 4] &= ~(M3_RENDER_DONE | M3_RENDER_DONE_B3 |
+                                    M3_PM_READY);
     } else if (off == M3_PM_GO && val == 1 && m3_clock_on(s)) {
         s->m3_pm_set = true;
         s->m3_ready_ns = now + 164 * SCALE_US;
