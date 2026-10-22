@@ -218,7 +218,14 @@ static void pxa2xx_dma_run(PXA2xxDMAState *s)
 
                 length = ch->cmd & DCMD_LEN;
                 size = DCMD_SIZE(ch->cmd);
-                width = DCMD_WIDTH(ch->cmd);
+                /*
+                 * Width field 0 (retropane): a memory-to-memory copy (Linux's
+                 * pxa memcpy leaves it 0). DCMD_WIDTH(0) shifted by -1
+                 * (undefined in C; on x86 a 2 GiB step). The X51v copies
+                 * the same with 0 as with word (retropane-os rp-probe
+                 * dma_shapes, 2026-10-22): moved a word at a time here.
+                 */
+                width = ((ch->cmd >> 14) & 3) ? DCMD_WIDTH(ch->cmd) : 4;
 
                 srcinc = (ch->cmd & DCMD_INCSRCADDR) ? width : 0;
                 destinc = (ch->cmd & DCMD_INCTRGADDR) ? width : 0;
