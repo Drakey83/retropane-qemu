@@ -22,6 +22,26 @@
  *    little-endian length and the bytes; each IN packet reaches the client
  *    as a 1-byte length and the bytes (a zero length is a zero-length
  *    packet).
+ *  - an MTP function (RetroPane ADR-0037), found as Windows finds it: by
+ *    Microsoft's OS descriptors (string 0xEE and the extended compatible
+ *    ID; with a USB 2.01 device, the BOS descriptor and the OS 2.0 set)
+ *    naming an interface "MTP". Its bulk pair and event (interrupt IN)
+ *    endpoint are bridged to a third chardev (`-global pxa27x-udc.mtp=<id>`)
+ *    in tagged frames, so the client can also send class requests:
+ *      client -> model: [type u8][length u32 LE][payload]
+ *        0x01 a bulk OUT transfer (split into packets; a transfer of whole
+ *             packets ends with a zero-length one, as MTP's data phases do)
+ *        0x02 a control request: 8 setup bytes, then the OUT data
+ *        0x03 part of a bulk OUT transfer: its packets, no closing
+ *             zero-length one (a transfer the client will cancel)
+ *      model -> client: [type u8][length u16 LE][payload]
+ *        0x81 a bulk IN packet      0x82 an event packet
+ *        0x83 a control reply: 1 status byte (0 done, 1 stalled), the data
+ *        0x84 a bulk endpoint stalled: its address
+ *    Properties: `ms-os20` (default on: a Windows 8.1+ host reads the OS
+ *    2.0 set; off plays an older one), `mtp-host` (default on: a host that
+ *    speaks MTP; off plays a Mac, which binds nothing to a vendor-class
+ *    interface and never opens a session).
  *
  * Like a real host, it reads the configuration descriptor to learn which
  * endpoint belongs to which function (by interface class), and both
@@ -178,6 +198,7 @@ struct Pxa27xUdcState {
     bool dreq_level[NEP];
     CharBackend chr;
     CharBackend msc;
+    CharBackend mtp;
     QEMUTimer *timer;
 
     uint32_t udccr;
@@ -213,6 +234,40 @@ struct Pxa27xUdcState {
     uint8_t msc_in_ep, msc_out_ep;
     int msc_iface;      /* -1: no mass storage interface */
     uint8_t max_lun;
+    /* Every endpoint the configuration names: interface, address, type. */
+    struct { uint8_t iface, addr, type; } eps[16];
+    uint32_t neps;
+    uint16_t bcd_usb;
+    /* Microsoft's OS descriptors as read: the vendor code (0: none), the
+     * interface each names "MTP" (-1: none), what was read (bits: 1 the
+     * string, 2 the 1.0 compatible ID, 4 the BOS, 8 the 2.0 set). */
+    uint8_t ms_vendor10, ms_vendor20;
+    int mtp_iface10, mtp_iface20;
+    uint32_t ms_read;
+    /* The script step in progress sent a request (a skipped one didn't:
+     * its check must not read the last step's reply). */
+    bool script_ran;
+    /* The MTP function: its interface (-1: none) and endpoint numbers. */
+    int mtp_iface;
+    uint8_t mtp_in_ep, mtp_out_ep, mtp_event_ep;
+    bool mtp_open;
+    bool ms_os20;
+    bool mtp_host;
+    /* MTP: frames from the client being parsed, OUT transfers queued, a
+     * control request waiting for endpoint 0 and the one running. */
+    uint8_t mtp_hdr[5];
+    uint32_t mtp_hdr_len;
+    uint8_t mtp_frame_type;
+    uint32_t mtp_frame_left;
+    Fifo8 mtp_rx;
+    uint32_t mtp_xfer[MSC_XFERS];
+    bool mtp_xfer_zlp[MSC_XFERS];
+    uint32_t mtp_xfer_head, mtp_xfer_count;
+    bool mtp_zlp_due;
+    uint8_t mtp_ctl[8 + EP0_SIZE * 4];
+    uint32_t mtp_ctl_len;
+    bool mtp_ctl_ready, mtp_ctl_running;
+    bool mtp_in_stall_told, mtp_out_stall_told;
 
     /* The host. */
     enum host_state state;
@@ -261,8 +316,27 @@ static void udc_update_irq(Pxa27xUdcState *s)
 static bool slot_active_bulk(Pxa27xUdcState *s, int x)
 {
     uint32_t c = s->cr[x];
-    return (c & 1) && ((c >> 13) & 3) == 2 &&
+    return (c & 1) && (((c >> 13) & 3) == 2 || ((c >> 13) & 3) == 3) &&
            ((c >> 22) & 7) == ((s->udccr >> 8) & 7);
+}
+
+/* Bulk proper (DMA-capable), not interrupt. */
+static bool slot_is_bulk(Pxa27xUdcState *s, int x)
+{
+    return ((s->cr[x] >> 13) & 3) == 2;
+}
+
+/* Maximum packet size of slot x (UDCCRx bits 11:2). */
+static uint32_t slot_mps(Pxa27xUdcState *s, int x)
+{
+    uint32_t m = (s->cr[x] >> 2) & 0x3FF;
+    return m && m <= BULK_SIZE ? m : BULK_SIZE;
+}
+
+/* Halted: the guest forces STALL (UDCCSRx.FST). */
+static bool slot_halted(Pxa27xUdcState *s, int x)
+{
+    return s->csr[x] & CSR0_FST;
 }
 
 static bool slot_is_in(Pxa27xUdcState *s, int x)
@@ -305,10 +379,10 @@ static bool bulk_push(BulkFifo *f, unsigned depth, const uint8_t *b,
 
 /* IN: a committed short packet waits (measured: nothing goes in behind
  * one, the endpoint reads full until it has gone). */
-static bool bulk_short_waits(BulkFifo *f)
+static bool bulk_short_waits(BulkFifo *f, uint32_t mps)
 {
     for (uint32_t i = 0; i < f->count; i++) {
-        if (f->q[(f->head + i) % 2].len < BULK_SIZE) {
+        if (f->q[(f->head + i) % 2].len < mps) {
             return true;
         }
     }
@@ -319,8 +393,8 @@ static bool bulk_short_waits(BulkFifo *f)
 static bool in_room(Pxa27xUdcState *s, int x)
 {
     BulkFifo *f = &s->bulk[x];
-    return f->count < slot_depth(s, x) && !bulk_short_waits(f) &&
-           f->fill.len < BULK_SIZE;
+    return f->count < slot_depth(s, x) && !bulk_short_waits(f, slot_mps(s, x))
+           && f->fill.len < slot_mps(s, x);
 }
 
 /* Drives each bulk slot's DMA request from its state. */
@@ -328,7 +402,8 @@ static void udc_update_dreq(Pxa27xUdcState *s)
 {
     for (int x = 1; x < NEP; x++) {
         bool on = false;
-        if (slot_active_bulk(s, x) && (s->csr[x] & CSR_DME)) {
+        if (slot_active_bulk(s, x) && slot_is_bulk(s, x) &&
+            (s->csr[x] & CSR_DME)) {
             if (slot_is_in(s, x)) {
                 on = in_room(s, x);
             } else {
@@ -405,6 +480,7 @@ static void host_setup(Pxa27xUdcState *s, uint8_t type, uint8_t req,
     s->stalled = false;
     s->xfer_steps = 0;
     s->phase = X_SETUP;
+    s->script_ran = true;
 }
 
 /* One step of the current control transfer. Returns true when it ended. */
@@ -502,6 +578,7 @@ static void host_parse_config(Pxa27xUdcState *s)
     s->cdc_in_ep = s->cdc_out_ep = 0;
     s->msc_in_ep = s->msc_out_ep = 0;
     s->msc_iface = -1;
+    s->neps = 0;
     for (uint32_t i = 0; i + 2 <= s->resp_len;) {
         uint8_t len = s->resp[i], type = s->resp[i + 1];
         if (len < 2 || i + len > s->resp_len) {
@@ -512,7 +589,13 @@ static void host_parse_config(Pxa27xUdcState *s)
             cls = s->resp[i + 5];
             sub = s->resp[i + 6];
             proto = s->resp[i + 7];
-        } else if (type == 5 && len >= 7 && (s->resp[i + 3] & 3) == 2) {
+        } else if (type == 5 && len >= 7 && s->neps < 16) {
+            s->eps[s->neps].iface = iface;
+            s->eps[s->neps].addr = s->resp[i + 2];
+            s->eps[s->neps].type = s->resp[i + 3] & 3;
+            s->neps++;
+        }
+        if (type == 5 && len >= 7 && (s->resp[i + 3] & 3) == 2) {
             uint8_t addr = s->resp[i + 2];
             bool in = addr & 0x80;
             uint8_t num = addr & 0xF;
@@ -527,10 +610,16 @@ static void host_parse_config(Pxa27xUdcState *s)
     }
 }
 
+static void mtp_bind(Pxa27xUdcState *s);
+
 /* The enumeration script: one control transfer per step number. */
 static void host_script_start(Pxa27xUdcState *s)
 {
     s->out_data_len = 0;
+    s->script_ran = false;
+    /* Each step's own time limit (one that ran out must not fail the next
+     * enumeration's bus reset at once). */
+    s->xfer_steps = 0;
     switch (s->step) {
     case 0:
     case 2:                                                   /* reset (2: then address) */
@@ -545,7 +634,53 @@ static void host_script_start(Pxa27xUdcState *s)
     case 6: host_setup(s, 0x80, 6, 0x0300, 0, 255); break;    /* languages */
     case 7: host_setup(s, 0x80, 6, 0x0302, 0x409, 255); break;/* product */
     case 8: host_setup(s, 0x80, 6, 0x0600, 0, 10); break;     /* qualifier */
-    case 9:
+    case 9:                                                   /* MS OS string */
+        /* A Mac (`mtp-host` off) asks for none of Microsoft's descriptors. */
+        if (s->mtp_host) {
+            host_setup(s, 0x80, 6, 0x03EE, 0, 18);
+        } else {
+            s->phase = X_NONE;
+        }
+        break;
+    case 10:                                                  /* compat ID head */
+        if (s->ms_vendor10) {
+            host_setup(s, 0xC0, s->ms_vendor10, 0, 4, 16);
+        } else {
+            s->phase = X_NONE;
+        }
+        break;
+    case 11: {                                                /* compat ID */
+        uint32_t n = s->resp_len >= 16 ? ldl_le_p(s->resp) : 0;
+        if (s->ms_vendor10 && n >= 16) {
+            host_setup(s, 0xC0, s->ms_vendor10, 0, 4, MIN(n, 255));
+        } else {
+            s->phase = X_NONE;
+        }
+        break;
+    }
+    case 12:                                                  /* BOS head */
+        if (s->bcd_usb >= 0x0201 && s->ms_os20 && s->mtp_host) {
+            host_setup(s, 0x80, 6, 0x0F00, 0, 5);
+        } else {
+            s->phase = X_NONE;
+        }
+        break;
+    case 13:                                                  /* BOS */
+        if (s->bcd_usb >= 0x0201 && s->ms_os20 && s->mtp_host &&
+            s->resp_len >= 4) {
+            host_setup(s, 0x80, 6, 0x0F00, 0, MIN(lduw_le_p(s->resp + 2), 255));
+        } else {
+            s->phase = X_NONE;
+        }
+        break;
+    case 14:                                                  /* MS OS 2.0 set */
+        if (s->ms_vendor20) {
+            host_setup(s, 0xC0, s->ms_vendor20, 0, 7, 255);
+        } else {
+            s->phase = X_NONE;
+        }
+        break;
+    case 15:
         /* SET_CONFIGURATION: answered by the hardware; the guest sees a
          * configuration-change interrupt and acknowledges with AREN. */
         s->udccr = (s->udccr & ~(3u << UDCCR_ACN_SHIFT))
@@ -555,7 +690,7 @@ static void host_script_start(Pxa27xUdcState *s)
         s->xfer_steps = 0;
         s->phase = X_WAIT_ACK;
         break;
-    case 10:
+    case 16:
         /* Get Max LUN, as Windows' storage driver asks first. */
         if (s->msc_iface >= 0) {
             host_setup(s, 0xA1, 0xFE, 0, s->msc_iface, 1);
@@ -567,18 +702,31 @@ static void host_script_start(Pxa27xUdcState *s)
         s->state = H_RUN;
         s->phase = X_NONE;
         s->open_step = 0;
+        mtp_bind(s);
         qemu_log_mask(LOG_UNIMP, "pxa27x-udc: enumerated and configured "
-                      "(serial %s, drive %s)\n",
+                      "(serial %s, drive %s, MTP %s; Microsoft OS "
+                      "descriptors read: %s%s%s%s)\n",
                       s->cdc_in_ep ? "yes" : "no",
-                      s->msc_iface >= 0 ? "yes" : "no");
+                      s->msc_iface >= 0 ? "yes" : "no",
+                      s->mtp_iface >= 0 ? "yes" : "no",
+                      s->ms_read & 1 ? "string " : "",
+                      s->ms_read & 2 ? "compat-id " : "",
+                      s->ms_read & 4 ? "bos " : "",
+                      s->ms_read & 8 ? "set-2.0" : "");
         break;
     }
 }
 
 static void host_script_check(Pxa27xUdcState *s)
 {
+    if (s->step >= 9 && s->step <= 14 && !s->script_ran) {
+        return; /* Microsoft's descriptors not asked for */
+    }
     switch (s->step) {
     case 1: case 3:
+        if (s->resp_len >= 4) {
+            s->bcd_usb = lduw_le_p(s->resp + 2);
+        }
         if (s->resp_len < 8 || s->resp[1] != 1) {
             host_fail(s, "bad device descriptor");
         } else if (s->step == 3 && !s->accept_composite &&
@@ -601,7 +749,78 @@ static void host_script_check(Pxa27xUdcState *s)
             host_fail(s, "a full-speed device must stall the qualifier");
         }
         break;
+    case 9:
+        /* "MSFT100" and the vendor code. */
+        s->ms_vendor10 = 0;
+        if (!s->stalled && s->resp_len >= 18 && s->resp[1] == 3 &&
+            !memcmp(s->resp + 2, "M\0S\0F\0T\0" "1\0" "0\0" "0\0", 14)) {
+            s->ms_vendor10 = s->resp[16];
+            s->ms_read |= 1;
+        }
+        break;
     case 10:
+        if (s->stalled) {
+            s->ms_vendor10 = 0;
+        }
+        break;
+    case 11:
+        /* The extended compatible ID: a function named "MTP". */
+        if (s->ms_vendor10 && !s->stalled && s->resp_len >= 16) {
+            s->ms_read |= 2;
+            uint32_t n = s->resp[8];
+            for (uint32_t k = 0; k < n && 16 + 24 * (k + 1) <= s->resp_len;
+                 k++) {
+                const uint8_t *f = s->resp + 16 + 24 * k;
+                if (!memcmp(f + 2, "MTP\0\0\0\0\0", 8)) {
+                    s->mtp_iface10 = f[0];
+                }
+            }
+        }
+        break;
+    case 13: {
+        /* The BOS: Microsoft's OS 2.0 platform capability. */
+        static const uint8_t uuid[16] = {
+            0xDF, 0x60, 0xDD, 0xD8, 0x89, 0x45, 0xC7, 0x4C,
+            0x9C, 0xD2, 0x65, 0x9D, 0x9E, 0x64, 0x8A, 0x9F };
+        if (s->stalled || s->resp_len < 5) {
+            break;
+        }
+        s->ms_read |= 4;
+        for (uint32_t i = 5; i + 3 <= s->resp_len;) {
+            uint8_t len = s->resp[i];
+            if (len < 3 || i + len > s->resp_len) {
+                break;
+            }
+            if (s->resp[i + 1] == 0x10 && s->resp[i + 2] == 5 && len >= 28 &&
+                !memcmp(s->resp + i + 4, uuid, 16)) {
+                s->ms_vendor20 = s->resp[i + 26];
+            }
+            i += len;
+        }
+        break;
+    }
+    case 14:
+        /* The OS 2.0 set: a function subset whose compatible ID is MTP. */
+        if (s->ms_vendor20 && !s->stalled && s->resp_len >= 10) {
+            s->ms_read |= 8;
+            int iface = -1;
+            for (uint32_t i = 0; i + 4 <= s->resp_len;) {
+                uint16_t len = lduw_le_p(s->resp + i);
+                uint16_t t = lduw_le_p(s->resp + i + 2);
+                if (len < 4 || i + len > s->resp_len) {
+                    break;
+                }
+                if (t == 2 && len >= 8) {
+                    iface = s->resp[i + 4];
+                } else if (t == 3 && len >= 20 &&
+                           !memcmp(s->resp + i + 4, "MTP\0\0\0\0\0", 8)) {
+                    s->mtp_iface20 = iface;
+                }
+                i += len;
+            }
+        }
+        break;
+    case 16:
         if (s->msc_iface >= 0) {
             if (s->stalled || s->resp_len != 1) {
                 /* Allowed by the spec for single-LUN devices. */
@@ -732,6 +951,167 @@ static void host_bridge_msc(Pxa27xUdcState *s)
     }
 }
 
+/* Which interface is MTP: the OS 2.0 set's answer first (Windows 8.1 and
+ * later prefer it), else the 1.0 compatible ID's; and its endpoints. A Mac
+ * (`mtp-host` off) binds nothing to it. */
+static void mtp_bind(Pxa27xUdcState *s)
+{
+    s->mtp_iface = -1;
+    s->mtp_in_ep = s->mtp_out_ep = s->mtp_event_ep = 0;
+    if (!s->mtp_host) {
+        return;
+    }
+    int iface = s->mtp_iface20 >= 0 ? s->mtp_iface20 : s->mtp_iface10;
+    if (iface < 0) {
+        return;
+    }
+    for (uint32_t k = 0; k < s->neps; k++) {
+        if (s->eps[k].iface != iface) {
+            continue;
+        }
+        uint8_t a = s->eps[k].addr;
+        if (s->eps[k].type == 2) {
+            *(a & 0x80 ? &s->mtp_in_ep : &s->mtp_out_ep) = a & 0xF;
+        } else if (s->eps[k].type == 3 && (a & 0x80)) {
+            s->mtp_event_ep = a & 0xF;
+        }
+    }
+    if (s->mtp_in_ep && s->mtp_out_ep) {
+        s->mtp_iface = iface;
+    }
+}
+
+/* The interrupt IN slot for endpoint `number`. */
+static int find_int_slot(Pxa27xUdcState *s, uint8_t number)
+{
+    for (int x = 1; x < NEP; x++) {
+        uint32_t c = s->cr[x];
+        if ((c & 1) && ((c >> 13) & 3) == 3 && slot_is_in(s, x) &&
+            ((c >> 15) & 0xF) == number &&
+            ((c >> 22) & 7) == ((s->udccr >> 8) & 7)) {
+            return x;
+        }
+    }
+    return -1;
+}
+
+static void mtp_send(Pxa27xUdcState *s, uint8_t type, const uint8_t *b,
+                     uint32_t n)
+{
+    uint8_t h[3] = { type, n & 0xff, n >> 8 };
+    qemu_chr_fe_write_all(&s->mtp, h, 3);
+    if (n) {
+        qemu_chr_fe_write_all(&s->mtp, b, n);
+    }
+}
+
+static void host_bridge_mtp(Pxa27xUdcState *s)
+{
+    if (s->mtp_iface < 0 || !s->mtp_open) {
+        return;
+    }
+    int in = find_slot(s, s->mtp_in_ep, true);
+    int out = find_slot(s, s->mtp_out_ep, false);
+    uint8_t p[BULK_SIZE];
+    /* A halted endpoint answers the host's tokens with STALL. */
+    if (in > 0 && slot_halted(s, in)) {
+        if (!s->mtp_in_stall_told) {
+            uint8_t a = 0x80 | s->mtp_in_ep;
+            mtp_send(s, 0x84, &a, 1);
+            s->mtp_in_stall_told = true;
+            s->csr[in] |= CSR0_SST;
+        }
+    } else {
+        s->mtp_in_stall_told = false;
+        int n = host_take_in(s, in, p);
+        if (n >= 0) {
+            mtp_send(s, 0x81, p, n);
+        }
+    }
+    int ev = s->mtp_event_ep ? find_int_slot(s, s->mtp_event_ep) : -1;
+    if (ev > 0) {
+        int n = host_take_in(s, ev, p);
+        if (n >= 0) {
+            mtp_send(s, 0x82, p, n);
+        }
+    }
+    if (out > 0 && slot_halted(s, out)) {
+        if (!s->mtp_out_stall_told && s->mtp_xfer_count) {
+            uint8_t a = s->mtp_out_ep;
+            mtp_send(s, 0x84, &a, 1);
+            s->mtp_out_stall_told = true;
+            s->csr[out] |= CSR0_SST;
+        }
+        return;
+    }
+    s->mtp_out_stall_told = false;
+    if (!host_can_out(s, out)) {
+        return;
+    }
+    if (s->mtp_zlp_due) {
+        host_put_out(s, out, p, 0);
+        s->mtp_zlp_due = false;
+        return;
+    }
+    if (s->mtp_xfer_count && s->mtp_xfer[s->mtp_xfer_head] == 0) {
+        host_put_out(s, out, p, 0);
+        s->mtp_xfer_head = (s->mtp_xfer_head + 1) % MSC_XFERS;
+        s->mtp_xfer_count--;
+        return;
+    }
+    if (s->mtp_xfer_count) {
+        uint32_t *left = &s->mtp_xfer[s->mtp_xfer_head];
+        uint32_t need = MIN(*left, BULK_SIZE);
+        if (fifo8_num_used(&s->mtp_rx) >= need) {
+            for (uint32_t i = 0; i < need; i++) {
+                p[i] = fifo8_pop(&s->mtp_rx);
+            }
+            host_put_out(s, out, p, need);
+            *left -= need;
+            if (*left == 0) {
+                s->mtp_zlp_due = s->mtp_xfer_zlp[s->mtp_xfer_head];
+                s->mtp_xfer_head = (s->mtp_xfer_head + 1) % MSC_XFERS;
+                s->mtp_xfer_count--;
+            }
+            qemu_chr_fe_accept_input(&s->mtp);
+        }
+    }
+}
+
+/* A control request from the MTP client, run on endpoint 0 while the
+ * functions run; its reply goes back as a 0x83 frame. */
+static void host_control_mtp(Pxa27xUdcState *s)
+{
+    if (s->mtp_ctl_running) {
+        if (host_xfer_step(s)) {
+            uint8_t r[1 + sizeof(s->resp)];
+            r[0] = s->stalled ? 1 : 0;
+            memcpy(r + 1, s->resp, s->resp_len);
+            mtp_send(s, 0x83, r, 1 + s->resp_len);
+            s->mtp_ctl_running = false;
+            s->mtp_ctl_ready = false;
+            qemu_chr_fe_accept_input(&s->mtp);
+        }
+        return;
+    }
+    if (s->mtp_ctl_ready && s->phase == X_NONE) {
+        const uint8_t *c = s->mtp_ctl;
+        if (c[0] == 0x21 && c[1] == 0x64) {
+            /* MTP's Cancel Request [SIC 5.2.1]: a host aborts its pending
+             * bulk OUT transfer first (Windows does), so nothing more of
+             * the cancelled data reaches the device. */
+            fifo8_reset(&s->mtp_rx);
+            s->mtp_xfer_head = s->mtp_xfer_count = 0;
+            s->mtp_zlp_due = false;
+        }
+        host_setup(s, c[0], c[1], lduw_le_p(c + 2), lduw_le_p(c + 4),
+                   lduw_le_p(c + 6));
+        s->out_data_len = MIN(s->mtp_ctl_len - 8, sizeof(s->out_data));
+        memcpy(s->out_data, c + 8, s->out_data_len);
+        s->mtp_ctl_running = true;
+    }
+}
+
 /* The controller is on and the connector is ours: a host that hasn't seen
  * the device (first plug-in, or after an unplug) enumerates it; one that
  * has keeps its old device and does nothing (the pull-up never went). */
@@ -786,6 +1166,11 @@ static void host_step(void *opaque)
         if (++s->attach_steps >= 100) { /* 10 ms after the pull-up */
             s->state = H_SCRIPT;
             s->step = 0;
+            s->ms_vendor10 = s->ms_vendor20 = 0;
+            s->mtp_iface10 = s->mtp_iface20 = s->mtp_iface = -1;
+            s->ms_read = 0;
+            s->bcd_usb = 0;
+            s->mtp_ctl_running = s->mtp_ctl_ready = false;
             host_script_start(s);
         }
         break;
@@ -806,6 +1191,8 @@ static void host_step(void *opaque)
         host_open_step(s);
         host_bridge_serial(s);
         host_bridge_msc(s);
+        host_control_mtp(s);
+        host_bridge_mtp(s);
         break;
     }
     if (s->state != H_IDLE) {
@@ -889,6 +1276,85 @@ static void msc_receive(void *opaque, const uint8_t *buf, int size)
     }
 }
 
+static int mtp_can_receive(void *opaque)
+{
+    Pxa27xUdcState *s = opaque;
+    if (s->state != H_RUN || s->mtp_xfer_count >= MSC_XFERS - 1 ||
+        s->mtp_ctl_ready) {
+        return 0;
+    }
+    return MIN(fifo8_num_free(&s->mtp_rx), sizeof(s->mtp_ctl));
+}
+
+static void mtp_reset_rx(Pxa27xUdcState *s)
+{
+    fifo8_reset(&s->mtp_rx);
+    s->mtp_xfer_head = s->mtp_xfer_count = 0;
+    s->mtp_hdr_len = 0;
+    s->mtp_frame_left = 0;
+    s->mtp_zlp_due = false;
+    s->mtp_ctl_ready = s->mtp_ctl_running = false;
+}
+
+static void mtp_event(void *opaque, QEMUChrEvent event)
+{
+    Pxa27xUdcState *s = opaque;
+
+    if (event == CHR_EVENT_OPENED || event == CHR_EVENT_CLOSED) {
+        s->mtp_open = event == CHR_EVENT_OPENED;
+        mtp_reset_rx(s);
+    }
+}
+
+static void mtp_receive(void *opaque, const uint8_t *buf, int size)
+{
+    Pxa27xUdcState *s = opaque;
+    for (int i = 0; i < size; i++) {
+        if (s->mtp_frame_left == 0) {
+            s->mtp_hdr[s->mtp_hdr_len++] = buf[i];
+            if (s->mtp_hdr_len < 5) {
+                continue;
+            }
+            s->mtp_hdr_len = 0;
+            s->mtp_frame_type = s->mtp_hdr[0];
+            uint32_t len = ldl_le_p(s->mtp_hdr + 1);
+            if (s->mtp_frame_type == 0x01 || s->mtp_frame_type == 0x03) {
+                if (s->mtp_xfer_count >= MSC_XFERS) {
+                    continue;
+                }
+                uint32_t tail = (s->mtp_xfer_head + s->mtp_xfer_count)
+                                % MSC_XFERS;
+                s->mtp_xfer[tail] = len;
+                s->mtp_xfer_zlp[tail] = s->mtp_frame_type == 0x01 &&
+                                        (len == 0 || len % BULK_SIZE == 0);
+                s->mtp_xfer_count++;
+                if (len == 0) {
+                    continue;
+                }
+            } else if (s->mtp_frame_type == 0x02) {
+                if (len < 8 || len > sizeof(s->mtp_ctl)) {
+                    continue;
+                }
+                s->mtp_ctl_len = 0;
+            } else {
+                continue;
+            }
+            s->mtp_frame_left = len;
+            continue;
+        }
+        if (s->mtp_frame_type != 0x02) {
+            if (!fifo8_is_full(&s->mtp_rx)) {
+                fifo8_push(&s->mtp_rx, buf[i]);
+            }
+        } else if (s->mtp_ctl_len < sizeof(s->mtp_ctl)) {
+            s->mtp_ctl[s->mtp_ctl_len++] = buf[i];
+        }
+        if (--s->mtp_frame_left == 0 && s->mtp_frame_type == 0x02) {
+            s->mtp_ctl_ready = true;
+        }
+    }
+}
+
 /* ---- guest side ------------------------------------------------------- */
 
 static void ep0_push(Pxa27xUdcState *s, const uint8_t *b, unsigned n)
@@ -909,15 +1375,16 @@ static void ep0_push(Pxa27xUdcState *s, const uint8_t *b, unsigned n)
 static void in_push(Pxa27xUdcState *s, int x, const uint8_t *b, unsigned n)
 {
     BulkFifo *f = &s->bulk[x];
-    if (f->count >= slot_depth(s, x) || bulk_short_waits(f)) {
+    uint32_t mps = slot_mps(s, x);
+    if (f->count >= slot_depth(s, x) || bulk_short_waits(f, mps)) {
         qemu_log_mask(LOG_GUEST_ERROR, "pxa27x-udc: wrote bulk IN slot %d "
                       "with no free buffer\n", x);
         return;
     }
-    for (unsigned i = 0; i < n && f->fill.len < BULK_SIZE; i++) {
+    for (unsigned i = 0; i < n && f->fill.len < mps; i++) {
         f->fill.d[f->fill.len++] = b[i];
     }
-    if (f->fill.len >= BULK_SIZE) {
+    if (f->fill.len >= mps) {
         in_commit(s, x);
     }
     udc_update_dreq(s);
@@ -965,7 +1432,7 @@ static uint64_t udc_read(void *opaque, hwaddr addr, unsigned size)
                 v &= ~(CSR_PC | CSR_SP);
                 if (p) {
                     v |= CSR_PC;
-                    if (p->len < BULK_SIZE) {
+                    if (p->len < slot_mps(s, y)) {
                         v |= CSR_SP;
                     }
                     if (p->pos < p->len) {
@@ -1069,8 +1536,11 @@ static void udc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         int y = (addr - CSR(0)) / 4;
         bool bulk = slot_active_bulk(s, y);
         bool in = slot_is_in(s, y);
-        /* DME takes the value of every write (drivers carry it). */
-        s->csr[y] = (s->csr[y] & ~CSR_DME) | (val & CSR_DME);
+        /* DME and FST take the value of every write (drivers carry them);
+         * SST is write-1-to-clear. */
+        s->csr[y] = (s->csr[y] & ~(CSR_DME | CSR0_FST)) |
+                    (val & (CSR_DME | CSR0_FST));
+        s->csr[y] &= ~(val & CSR0_SST);
         if (val & CSR_PC) {
             s->csr[y] &= ~CSR_PC;
             if (bulk && !in) {
@@ -1143,6 +1613,11 @@ static void udc_reset(DeviceState *dev)
     udc_update_dreq(s);
     s->msc_iface = -1;
     s->cdc_in_ep = s->cdc_out_ep = s->msc_in_ep = s->msc_out_ep = 0;
+    s->mtp_iface = s->mtp_iface10 = s->mtp_iface20 = -1;
+    s->ms_vendor10 = s->ms_vendor20 = 0;
+    s->ms_read = 0;
+    s->neps = 0;
+    mtp_reset_rx(s);
     s->state = H_IDLE;
     s->phase = X_NONE;
     s->open_step = 0;
@@ -1166,11 +1641,15 @@ static void udc_realize(DeviceState *dev, Error **errp)
     fifo8_create(&s->ep0_rx, 64);
     fifo8_create(&s->host_rx, 256);
     fifo8_create(&s->msc_rx, MSC_RX);
+    fifo8_create(&s->mtp_rx, MSC_RX);
     s->msc_iface = -1;
+    s->mtp_iface = s->mtp_iface10 = s->mtp_iface20 = -1;
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, host_step, s);
     qemu_chr_fe_set_handlers(&s->chr, udc_can_receive, udc_receive, udc_event,
                              NULL, s, NULL, true);
     qemu_chr_fe_set_handlers(&s->msc, msc_can_receive, msc_receive, msc_event,
+                             NULL, s, NULL, true);
+    qemu_chr_fe_set_handlers(&s->mtp, mtp_can_receive, mtp_receive, mtp_event,
                              NULL, s, NULL, true);
     /* Without a chardev there is nothing to wait for. */
     s->chr_open = !qemu_chr_fe_backend_connected(&s->chr);
@@ -1180,6 +1659,9 @@ static void udc_realize(DeviceState *dev, Error **errp)
 static Property udc_properties[] = {
     DEFINE_PROP_CHR("chardev", Pxa27xUdcState, chr),
     DEFINE_PROP_CHR("msc", Pxa27xUdcState, msc),
+    DEFINE_PROP_CHR("mtp", Pxa27xUdcState, mtp),
+    DEFINE_PROP_BOOL("ms-os20", Pxa27xUdcState, ms_os20, true),
+    DEFINE_PROP_BOOL("mtp-host", Pxa27xUdcState, mtp_host, true),
     DEFINE_PROP_BOOL("accept-composite", Pxa27xUdcState, accept_composite,
                      true),
     DEFINE_PROP_BOOL("fixed-pullup", Pxa27xUdcState, fixed_pullup, true),
