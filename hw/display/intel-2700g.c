@@ -1124,6 +1124,16 @@ static void i2700g_ev_tick(void *opaque)
 #define M3_ADDR_MASK        0x01FFFFFCu
 #define M3_STRIP_FLAT       0x40800000u
 #define M3_STRIP_TEX        0x41000000u
+/*
+ * Four-corner objects (retropane-os R78 item 3): mask bits 30 and 29 and
+ * the layout one past the triangle's (5 flat, 9 textured); 22 and 33
+ * words, the corners in strip order, drawn as v0 v1 v2 then v1 v3 v2. The
+ * flat one drew exactly as its two triangles on the X51v (rp-glesfeat G2);
+ * the textured one is Dell's display driver's rectangle (ddi_2700g.dll
+ * 0x02117d9c, 0x02118414).
+ */
+#define M3_STRIP_QUAD       0x60A00000u
+#define M3_STRIP_TEX_QUAD   0x61200000u
 #define M3_TSP_GOURAUD      (1u << 22)
 #define M3_TSP_BLEND        (1u << 13)
 #define M3_TSP_NO_WRITE     (1u << 7)
@@ -1170,32 +1180,36 @@ static double m3_float(uint32_t w)
     return f;
 }
 
+/*
+ * An object of `n` corners (3, or 4 for a four-corner object: its fourth
+ * corner in *fourth): the header, the x/y pairs, then z, 1/w and the
+ * colours (with u and v when textured), n of each.
+ */
 static void m3_object(Intel2700GState *s, uint32_t at, bool textured,
-                      M3Obj *o)
+                      int n, M3Obj *o, M3Vertex *fourth)
 {
+    uint32_t h = textured ? 5 : 2;
     int k;
 
     o->textured = textured;
     o->isp = m3_word(s, at);
-    if (textured) {
-        o->tsp = m3_word(s, at + 4 * 4);
-        for (k = 0; k < 3; k++) {
-            o->tex[k] = m3_word(s, at + 4 * (1 + k));
-            o->v[k].x = m3_float(m3_word(s, at + 4 * (5 + 2 * k)));
-            o->v[k].y = m3_float(m3_word(s, at + 4 * (6 + 2 * k)));
-            o->v[k].z = m3_float(m3_word(s, at + 4 * (11 + k)));
-            o->v[k].argb = m3_word(s, at + 4 * (17 + 3 * k));
-            o->v[k].u = m3_float(m3_word(s, at + 4 * (18 + 3 * k)));
-            o->v[k].v = m3_float(m3_word(s, at + 4 * (19 + 3 * k)));
-        }
-    } else {
-        o->tsp = m3_word(s, at + 4);
-        for (k = 0; k < 3; k++) {
-            o->v[k].x = m3_float(m3_word(s, at + 4 * (2 + 2 * k)));
-            o->v[k].y = m3_float(m3_word(s, at + 4 * (3 + 2 * k)));
-            o->v[k].z = m3_float(m3_word(s, at + 4 * (8 + k)));
-            o->v[k].argb = m3_word(s, at + 4 * (14 + k));
-            o->v[k].u = o->v[k].v = 0;
+    o->tsp = m3_word(s, at + 4 * (textured ? 4 : 1));
+    for (k = 0; k < 3 && textured; k++) {
+        o->tex[k] = m3_word(s, at + 4 * (1 + k));
+    }
+    for (k = 0; k < n; k++) {
+        M3Vertex *v = k < 3 ? &o->v[k] : fourth;
+
+        v->x = m3_float(m3_word(s, at + 4 * (h + 2 * k)));
+        v->y = m3_float(m3_word(s, at + 4 * (h + 1 + 2 * k)));
+        v->z = m3_float(m3_word(s, at + 4 * (h + 2 * n + k)));
+        if (textured) {
+            v->argb = m3_word(s, at + 4 * (h + 4 * n + 3 * k));
+            v->u = m3_float(m3_word(s, at + 4 * (h + 4 * n + 3 * k + 1)));
+            v->v = m3_float(m3_word(s, at + 4 * (h + 4 * n + 3 * k + 2)));
+        } else {
+            v->argb = m3_word(s, at + 4 * (h + 4 * n + k));
+            v->u = v->v = 0;
         }
     }
 }
@@ -1635,18 +1649,21 @@ static int64_t m3_render(Intel2700GState *s)
         }
         for (j = 0; j < 512; j++) {
             uint32_t p = m3_word(s, list + 4 * j), flags = p & 0xFFE00000;
+            bool tex = flags == M3_STRIP_TEX || flags == M3_STRIP_TEX_QUAD;
+            bool quad = flags == M3_STRIP_QUAD || flags == M3_STRIP_TEX_QUAD;
+            M3Vertex fourth;
             M3Obj o;
 
             if (p >> 28 == 0xF) {
                 break;
             }
-            if (flags != M3_STRIP_FLAT && flags != M3_STRIP_TEX) {
+            if (flags != M3_STRIP_FLAT && !tex && !quad) {
                 qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: strip pointer"
                               " flags 0x%08x never measured\n", flags);
                 break;
             }
-            m3_object(s, params + (p & 0x001FFFFF) * 4,
-                      flags == M3_STRIP_TEX, &o);
+            m3_object(s, params + (p & 0x001FFFFF) * 4, tex, quad ? 4 : 3,
+                      &o, &fourth);
             /* TEX1 bit 30 without 29 hung the core too (version 24). */
             if ((o.tsp & M3_TSP_HANGS) ||
                 (o.textured && (o.tex[1] & 0x60000000) == 0x40000000)) {
@@ -1654,8 +1671,17 @@ static int64_t m3_render(Intel2700GState *s)
                 return -1;              /* as on the device: until a reset */
             }
             m3_draw(s, &o, t);
+            if (quad) {
+                M3Obj second = o;
+
+                second.v[0] = o.v[1];
+                second.v[1] = fourth;
+                second.v[2] = o.v[2];
+                m3_draw(s, &second, t);
+            }
             if (j > 0) {
-                cost += m3_quad_cost(&o);
+                /* A four-corner object as its two triangles (assumed). */
+                cost += m3_quad_cost(&o) * (quad ? 2 : 1);
             }
         }
         /*
