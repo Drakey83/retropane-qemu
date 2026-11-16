@@ -20,10 +20,12 @@
  * device. The display counts scan lines, sets its line and frame events and
  * raises its interrupt output ("irq", GPIO85 on the X51v) as measured.
  * The MBX 3D core renders its direct path (objects, lists and region
- * arrays the CPU writes) as measured (see "The MBX 3D core" below).
+ * arrays the CPU writes) as measured (see "The MBX 3D core" below), and its
+ * tile accelerator bins a vertex stream into the objects, lists and region
+ * array the X51v's writes (see "The tile accelerator" below).
  *
- * Not modelled (the registers just read back what was written): the MBX 3D
- * core's tile accelerator, the 2D engine's other operations (scaling, rotation, palettes,
+ * Not modelled (the registers just read back what was written): the 2D
+ * engine's other operations (scaling, rotation, palettes,
  * masks, ROPs other than copy and pattern copy), the MVED1 decoder, the
  * hardware cursor, colour keys, the video plane's gamma, the video scaler
  * (the video plane is shown 1:1), scan-out under/overruns and the PLLs.
@@ -149,6 +151,54 @@ typedef struct ScanLog {
 
 OBJECT_DECLARE_SIMPLE_TYPE(Intel2700GState, INTEL_2700G)
 
+/* The tile accelerator's words a vertex at most: x, y, z, 1/w, colour, two u, v. */
+#define TA_VERT_WORDS   9
+#define TA_TILES        (128 * 128)     /* tile coordinates are 7 bits */
+#define TA_PORT             0x14000
+#define TA_END_PORT         0x16000
+#define TA_PORT_SIZE        0x1000
+#define TA_START            0x800
+#define TA_DONE             (1u << 4)
+#define TA_SCENE_END        (1u << 7)       /* 0x85C */
+#define TA_END_WORD         0xF0000000u
+#define TA_MASK_KNOWN       0x5Fu
+#define TA_TSP_SECOND_UV    (1u << 16)
+#define TA_TSP_COLOURLESS   (1u << 14)
+#define TA_CLEAR_TSP        0x22206F80u     /* the GLES clear's (0x0226DFF0) */
+#define TA_CLIP_ON          (1u << 29)
+#define TA_REGION_HEADER    (1u << 29)
+#define TA_BLOCK_BYTES      64
+#define TA_LINK_SLOT        60              /* word 15 */
+#define TA_PAGE             0x1000u
+#define TA_REACH            0x800000u       /* the manager's 8 MiB */
+#define TA_MAX_VERTS        (1 << 20)
+
+typedef struct TAVert {
+    uint32_t w[TA_VERT_WORDS];
+} TAVert;
+
+/* The tile accelerator: the stream's parser and the scene it bins. */
+typedef struct TAState {
+    bool on;                        /* started (0x800 = 1), no scene end yet */
+    bool fault;                     /* a word refused: no done this scene */
+    bool aliased;                   /* written past the 8 MiB reach, logged */
+    int64_t done_ns;                /* status bit 4 due; M3_NONE: none */
+    uint32_t cursor;                /* the parameter memory's next free byte */
+    uint32_t scene_bytes;           /* taken this scene (and skipped) */
+    uint32_t entries;               /* list entries this scene */
+    /* The state block's words, kept across primitives and scenes. */
+    uint32_t tsp, isp, tex[2][3], clip, word6;
+    bool textured;                  /* the last TSP's block had mask bit 2 */
+    uint32_t mask;                  /* a state block being read; 0: none */
+    int field;                      /* its next field (ta_next_field) */
+    uint32_t prim;                  /* the primitive being read; 0: none */
+    int vwords, vat;                /* words a vertex; of the current one */
+    TAVert cur;
+    GArray *verts;                  /* the primitive's vertices so far */
+    uint32_t cols, rows;
+    uint32_t *head, *tail, *block;  /* each tile's list: first, next, block */
+} TAState;
+
 struct Intel2700GState {
     SysBusDevice parent_obj;
 
@@ -185,7 +235,12 @@ struct Intel2700GState {
     int64_t m3_ready_ns;            /* memory manager ready due */
     bool m3_pm_set;                 /* the memory manager was started */
     bool m3_hung;                   /* until a reset */
+    bool m3_hang_needs_clock;       /* a two-unit hang: a reset alone keeps it */
+    bool m3_clock_cycled;           /* the 3D clock went off since it hung */
     QEMUTimer *m3_timer;            /* render done, for its interrupt */
+
+    /* The tile accelerator (see "The tile accelerator" below). */
+    TAState ta;
 
     /*
      * Plane start writes in a frame, by scan line: a GSCADR or VSCADR
@@ -1081,9 +1136,26 @@ static void i2700g_ev_tick(void *opaque)
  * Writing 1 to 0x680 renders the region array at 0x608: two words a tile
  * (x | y << 8, bit 31 on the last; the tile's object list), each 8 x 16
  * tile written whole into the target at 0x65C (stride 0x660 words),
- * uncovered pixels white, unlisted tiles untouched. Lists hold strip
- * pointers (0x40800000 flat 17-word objects, 0x41000000 textured 26-word
- * ones, offsets in words from 0x60C) up to an 0xF... end word. Flat shading
+ * uncovered pixels white, unlisted tiles untouched, and a tile whose header
+ * has bit 25 (the TA's empty tile: rp-tabench run 4, "tiles without a quad
+ * left untouched") skipped. Lists hold strip pointers up to an 0xF... end
+ * word, an 0xE... word linking on to the list's next block (the TA's
+ * 16-word blocks, word 15: Dell's captured frame, retropane-os
+ * local/g7-dell-frame.bin). A strip pointer: bits 30-25 a triangle mask
+ * (bit 30 the strip's first triangle), bits 24-23 the object's class (1
+ * flat or Gouraud, 2 one texture, 3 two, 0 the GLES clear's colourless
+ * form), bits 22-21 its corners less three, bits 20-0 the offset in words
+ * from 0x60C: 0x40800000 the flat 17-word triangle, 0x41000000 the
+ * textured 26-word one, 0x60A00000 and 0x61200000 their four-corner
+ * forms (all measured); objects of five and six corners and masks with
+ * some triangles clear are the TA's (Dell's frame's lists, e.g. 0x48ea7340
+ * and 0x08ea9180: a six-corner strip's first and fourth, its fourth only),
+ * drawn as the strip's triangles, each the corners i, i+1, i+2 in strip
+ * order (odd ones i, i+2, i+1: the winding kept). Class 0 (rp-tabench run
+ * 4: the clear's object drew nothing and nothing after it in its tile,
+ * audit C80) leaves the tile white and stops its list, logged; class 3
+ * hangs the core (rp-glesfeat M), a hang a reset alone keeps until the 3D
+ * clock goes off (rp-glesfeat M2, audit C53). Flat shading
  * takes the first vertex's colour, TSP bit 22 Gouraud; textures are
  * twiddled, point sampled, TEX0 bits 15-13 the format, 27-24/23-20 the
  * sides, 31-28 the address modes (wrap, mirror, clamp); TSP bit 13 blends
@@ -1106,7 +1178,7 @@ static void i2700g_ev_tick(void *opaque)
  * rp-mbx3d-api run 4).
  * (Version 23's "less never passes" was the depth mode written into the
  * alpha-test bits: an alpha test "alpha < 0".) Not modelled:
- * the tile accelerator, the interrupt line (render done never edged
+ * the interrupt line (render done never edged
  * GPIO85), filtering, depth across renders (0x674).
  */
 #define R_MBXCLK            0x0054
@@ -1122,18 +1194,19 @@ static void i2700g_ev_tick(void *opaque)
 #define M3_PM_READY         (1u << 6)
 #define M3_LAST             (1u << 31)
 #define M3_ADDR_MASK        0x01FFFFFCu
-#define M3_STRIP_FLAT       0x40800000u
-#define M3_STRIP_TEX        0x41000000u
 /*
- * Four-corner objects (retropane-os R78 item 3): mask bits 30 and 29 and
- * the layout one past the triangle's (5 flat, 9 textured); 22 and 33
- * words, the corners in strip order, drawn as v0 v1 v2 then v1 v3 v2. The
- * flat one drew exactly as its two triangles on the X51v (rp-glesfeat G2);
- * the textured one is Dell's display driver's rectangle (ddi_2700g.dll
- * 0x02117d9c, 0x02118414).
+ * Strip pointers (see above). Four-corner objects (retropane-os R78 item
+ * 3): the flat one drew exactly as its two triangles on the X51v
+ * (rp-glesfeat G2); the textured one is Dell's display driver's rectangle
+ * (ddi_2700g.dll 0x02117d9c, 0x02118414).
  */
-#define M3_STRIP_QUAD       0x60A00000u
-#define M3_STRIP_TEX_QUAD   0x61200000u
+#define M3_PTR_MASK(p)      (((p) >> 25) & 0x3F)  /* bit 5: the first triangle */
+#define M3_PTR_CLASS(p)     (((p) >> 23) & 3)
+#define M3_PTR_CORNERS(p)   ((((p) >> 21) & 3) + 3)
+#define M3_LINK             0xEu                  /* top nibble */
+#define M3_END              0xFu
+#define M3_REGION_EMPTY     (1u << 25)
+#define M3_LIST_MAX         16384                 /* words a tile's list */
 #define M3_TSP_GOURAUD      (1u << 22)
 #define M3_TSP_BLEND        (1u << 13)
 #define M3_TSP_NO_WRITE     (1u << 7)
@@ -1181,16 +1254,25 @@ static double m3_float(uint32_t w)
 }
 
 /*
- * An object of `n` corners (3, or 4 for a four-corner object: its fourth
- * corner in *fourth): the header, the x/y pairs, then z, 1/w and the
- * colours (with u and v when textured), n of each.
+ * An object of `n` corners (3 to 6), its corners in v[] (strip order):
+ * the header, the x/y pairs, then z, 1/w and the colours (with u and v
+ * when textured), n of each. Its triangles are drawn from o->v[] by
+ * m3_triangle.
  */
-static void m3_object(Intel2700GState *s, uint32_t at, bool textured,
-                      int n, M3Obj *o, M3Vertex *fourth)
+typedef struct M3Strip {
+    M3Obj o;                        /* the header; v[] set per triangle */
+    int n;
+    M3Vertex v[6];
+} M3Strip;
+
+static void m3_strip(Intel2700GState *s, uint32_t at, bool textured, int n,
+                     M3Strip *st)
 {
     uint32_t h = textured ? 5 : 2;
+    M3Obj *o = &st->o;
     int k;
 
+    st->n = n;
     o->textured = textured;
     o->isp = m3_word(s, at);
     o->tsp = m3_word(s, at + 4 * (textured ? 4 : 1));
@@ -1198,7 +1280,7 @@ static void m3_object(Intel2700GState *s, uint32_t at, bool textured,
         o->tex[k] = m3_word(s, at + 4 * (1 + k));
     }
     for (k = 0; k < n; k++) {
-        M3Vertex *v = k < 3 ? &o->v[k] : fourth;
+        M3Vertex *v = &st->v[k];
 
         v->x = m3_float(m3_word(s, at + 4 * (h + 2 * k)));
         v->y = m3_float(m3_word(s, at + 4 * (h + 1 + 2 * k)));
@@ -1636,53 +1718,81 @@ static int64_t m3_render(Intel2700GState *s)
     double clear_z = r6dc & 1 ? m3_float(r6dc & ~1u) : NAN;
     M3Tile *t = g_new(M3Tile, 1);
 
-    for (k = 0; k < 4096; k++) {
+    for (k = 0; k < TA_TILES; k++) {
         uint32_t w0 = m3_word(s, regions + 8 * k);
         uint32_t list = m3_word(s, regions + 8 * k + 4) & M3_ADDR_MASK;
+        uint32_t objects = 0;
         int px, py;
 
+        if (w0 & M3_REGION_EMPTY) {
+            /* The TA's empty tile: not rendered, its pixels untouched. */
+            if (w0 & M3_LAST) {
+                break;
+            }
+            continue;
+        }
         t->x = (w0 & 127) * M3_TILE_W;
         t->y = ((w0 >> 8) & 127) * M3_TILE_H;
         for (j = 0; j < M3_TILE_W * M3_TILE_H; j++) {
             t->c[j] = 0xFFFFFFFF;
             t->z[j] = clear_z;
         }
-        for (j = 0; j < 512; j++) {
-            uint32_t p = m3_word(s, list + 4 * j), flags = p & 0xFFE00000;
-            bool tex = flags == M3_STRIP_TEX || flags == M3_STRIP_TEX_QUAD;
-            bool quad = flags == M3_STRIP_QUAD || flags == M3_STRIP_TEX_QUAD;
-            M3Vertex fourth;
-            M3Obj o;
+        for (j = 0; j < M3_LIST_MAX; j++, list += 4) {
+            uint32_t p = m3_word(s, list), mask = M3_PTR_MASK(p);
+            uint32_t cls = M3_PTR_CLASS(p);
+            int n = M3_PTR_CORNERS(p), i;
+            M3Strip st;
 
-            if (p >> 28 == 0xF) {
+            if (p >> 28 == M3_END) {
                 break;
             }
-            if (flags != M3_STRIP_FLAT && !tex && !quad) {
+            if (p >> 28 == M3_LINK) {
+                list = (p & M3_ADDR_MASK) - 4;  /* the next block */
+                continue;
+            }
+            /* Triangles past the object's corners, or none, or bit 31. */
+            if ((p & M3_LAST) || mask == 0 ||
+                (mask & ((1u << (8 - n)) - 1))) {
                 qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: strip pointer"
-                              " flags 0x%08x never measured\n", flags);
+                              " 0x%08x never measured\n", p);
                 break;
             }
-            m3_object(s, params + (p & 0x001FFFFF) * 4, tex, quad ? 4 : 3,
-                      &o, &fourth);
+            if (cls == 0) {
+                qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: the GLES"
+                              " clear's colourless object (0x%08x, class 0):"
+                              " tile (%u, %u) left white and its list"
+                              " stopped, as rp-tabench run 4 saw on the"
+                              " X51v (audit C80)\n", p, t->x / M3_TILE_W,
+                              t->y / M3_TILE_H);
+                break;
+            }
+            if (cls == 3) {
+                /* A two-unit object (rp-glesfeat M, M2): the hang C53. */
+                s->m3_hang_needs_clock = true;
+                g_free(t);
+                return -1;
+            }
+            m3_strip(s, params + (p & 0x001FFFFF) * 4, cls == 2, n, &st);
             /* TEX1 bit 30 without 29 hung the core too (version 24). */
-            if ((o.tsp & M3_TSP_HANGS) ||
-                (o.textured && (o.tex[1] & 0x60000000) == 0x40000000)) {
+            if ((st.o.tsp & M3_TSP_HANGS) ||
+                (st.o.textured && (st.o.tex[1] & 0x60000000) == 0x40000000)) {
                 g_free(t);
                 return -1;              /* as on the device: until a reset */
             }
-            m3_draw(s, &o, t);
-            if (quad) {
-                M3Obj second = o;
-
-                second.v[0] = o.v[1];
-                second.v[1] = fourth;
-                second.v[2] = o.v[2];
-                m3_draw(s, &second, t);
+            for (i = 0; i < n - 2; i++) {
+                if (!(mask & (0x20u >> i))) {
+                    continue;
+                }
+                st.o.v[0] = st.v[i];
+                st.o.v[1] = st.v[i + 1 + (i & 1)];
+                st.o.v[2] = st.v[i + 2 - (i & 1)];
+                m3_draw(s, &st.o, t);
+                if (objects > 0) {
+                    /* Each triangle half a quad (a strip's: assumed). */
+                    cost += m3_quad_cost(&st.o);
+                }
             }
-            if (j > 0) {
-                /* A four-corner object as its two triangles (assumed). */
-                cost += m3_quad_cost(&o) * (quad ? 2 : 1);
-            }
+            objects++;
         }
         /*
          * The target's format (0x650, rp-mbx3d version 26): 6 ARGB8888,
@@ -1753,11 +1863,583 @@ static void m3_tick(Intel2700GState *s)
         s->m3_ready_ns = M3_NONE;
         s->mbx[MBX_STATUS / 4] |= M3_PM_READY;
     }
+    if (m3_passed(s->ta.done_ns)) {
+        s->ta.done_ns = M3_NONE;
+        s->mbx[MBX_STATUS / 4] |= TA_DONE;
+    }
 }
 
 static bool m3_clock_on(Intel2700GState *s)
 {
     return (s->regs[R_MBXCLK / 4] & 3) == 2;
+}
+
+/*
+ * The tile accelerator (TA; retropane-os docs/hw/2700g.md "P4", drivers/
+ * mbx3d mod ta, R288). Its word stream goes into the window at +0x14000
+ * (4 KiB, any offset: a FIFO), a primitive's end is any write to +0x16000,
+ * 0x800 = 1 starts a scene after the start table (0x840 the tail buffer,
+ * 0x844 the region array, 0x84C/0x850 the target's width and height << 16,
+ * 0x85C the grid), and the scene ends with 0xF0000000 in the window while
+ * 0x85C bit 7 is set. Status bit 4 then says done.
+ *
+ * Rule 0. PowerVR's TA bins each primitive into per-tile object lists in
+ * hardware; Dreamcast emulators (reicast, flycast) model it by parsing the
+ * stream into polygons and rasterising those directly, the region array
+ * and lists never built. Ours parses the stream exactly as fed and writes
+ * what the X51v's TA writes, so the 3D core above draws the scene from the
+ * device's own data structures by the device's path (0x608 pointed at the
+ * TA's region array): every renderer that feeds the TA (ref_rp, the ports,
+ * a GLES layer) is checked word for word against what the chip reads, and
+ * the software's render step is checked with it, not bypassed.
+ *
+ * Measured (the X51v; retropane-os docs/hw/2700g.md, local/g7-dell-frame.bin
+ * Dell's own TA frame, rp-tabench runs 1-9, rp-glesfeat G, G2, L, M):
+ * - The state block: 0x1... and a mask; after it, in this order, TSP (bit
+ *   0), ISP (1), texture unit 0's TEX0-2 (2), unit 1's (3, read only with
+ *   TSP bit 16: without it the TA ignores them, M), the clip word (4),
+ *   the bit-6 word (6). Fields left out keep their values (rp-tabench's
+ *   "state once" drew right).
+ * - Primitives: 0x4... a strip, 0x7... a triangle list (0x5..., a fan, is
+ *   the GLES driver's, never fed here: drawn as its triangles, assumed),
+ *   then vertices: x, y, z, 1/w, colour, then u, v for each texture unit
+ *   (5, 7 or 9 words); the GLES clear's TSP 0x22206F80 untextured sends x,
+ *   y, z only. A write to the end window ends the primitive.
+ * - Objects (the 3D core's forms above): class 1 ISP, TSP, x/y, z, 1/w,
+ *   colour (17 words a triangle); class 2 ISP, TEX0-2, TSP, ..., colour, u,
+ *   v (26); class 3 ISP, unit 0's and unit 1's TEX0-2, TSP, ..., colour,
+ *   u0, v0, u1, v1 (35; the M log printed 32 of them); class 0 TSP, x/y, z
+ *   (10). A strip is one object of up to six corners (Dell's frame's lists),
+ *   longer strips split into objects of six sharing two corners.
+ * - Its parameter memory: the memory manager's pages (0x828 the first,
+ *   0x82C the last), from one pointer for objects and list blocks alike,
+ *   none crossing a 4 KiB page (Dell's frame: an object, then each tile's
+ *   first block, then the next object; a block that didn't fit its page
+ *   moved to the next). List entries are strip pointers with the offset
+ *   from 0x83C; 16-word blocks, word 15 a link 0xE0000000 | the next block.
+ * - Past the manager's 8 MiB reach the TA's writes land 8 MiB lower
+ *   (rp-mbx3d version 14) while its pointers keep the full offset, so the
+ *   3D core reads nothing there (rp-tabench run 2's white tiles).
+ * - The region array (0x844): every tile of the grid in raster order,
+ *   x | y << 8 | bit 29, bit 25 on a tile with no list (rp-tabench run 4),
+ *   bit 31 on the last.
+ * - Done ~0.64 ms after the scene's end word, a little more for big scenes
+ *   (rp-tabench run 9: done minus the feed, 646-951 us): 640 us + 1.8 ns a
+ *   list entry here; the feed itself is the emulated CPU's.
+ * - A two-unit object hangs the 3D core, a hang a core reset alone keeps
+ *   (C53); the TA doesn't start while the core is hung.
+ *
+ * Assumed (not measured; docs/hw/emulator.md): which tiles get an entry
+ * (each triangle's bounding box, clipped to the grid and the clip word:
+ * never fewer than the device's, maybe more); a strip's per-tile mask from
+ * those boxes; a triangle list's and a fan's objects as single triangles;
+ * the pointer continuing across scenes until the manager is set up again,
+ * wrapping at its last page (Dell's scenes lay mid-memory); end words
+ * written at the scene end; the tail buffer (0x840) not written (its form
+ * is unknown); the TA's FIFO level (510 on the device while it bins) not
+ * shown. u and v go into the objects as fed, affine, and 1/w is copied:
+ * how the TA treats perspective (u, v divided by w or not, z and 1/w's
+ * range) is R289's question, never measured; until then this model and
+ * the 3D core draw u, v affinely.
+ *
+ * Refused loudly (logged, the scene never says done, as a device that
+ * hung would look): unknown mask bits, a primitive word with its low bits
+ * set (a polygon offset never measured), an untextured TSP with bit 14
+ * but the clear's, words where a state block or primitive belongs that
+ * are neither, a primitive ended mid-vertex or mid-state block, a scene
+ * larger than the parameter memory.
+ */
+
+static void ta_fault(Intel2700GState *s, const char *what, uint32_t w)
+{
+    qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: TA: %s (0x%08x); the scene"
+                  " is refused and never says done\n", what, w);
+    s->ta.fault = true;
+}
+
+/* A word into the TA's output, at the manager's 8 MiB alias. */
+static void ta_store(Intel2700GState *s, uint32_t a, uint32_t v)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+    if (a >= TA_REACH) {
+        if (!s->ta.aliased) {
+            qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: TA: parameter"
+                          " memory at 0x%08x, past the manager's 8 MiB:"
+                          " written 8 MiB lower (rp-mbx3d version 14)\n", a);
+            s->ta.aliased = true;
+        }
+        a &= TA_REACH - 1;
+    }
+    if (a + 4 <= INTEL_2700G_VRAM_SIZE) {
+        stl_le_p(vram + a, v);
+    }
+}
+
+/*
+ * `bytes` of the parameter memory from the one pointer, never across a
+ * 4 KiB page; 0 (and the scene refused) when the scene outgrows it.
+ */
+static uint32_t ta_alloc(Intel2700GState *s, uint32_t bytes)
+{
+    TAState *ta = &s->ta;
+    uint32_t first = s->mbx[0x828 / 4] << 12;
+    uint32_t end = (s->mbx[0x82C / 4] + 1) << 12;
+    uint32_t c = ta->cursor, at;
+
+    if (ta->fault) {
+        return 0;
+    }
+    if (end <= first) {
+        ta_fault(s, "the memory manager has no pages (0x828 past 0x82C)",
+                 s->mbx[0x828 / 4]);
+        return 0;
+    }
+    if (c < first || c >= end) {
+        c = first;
+    }
+    if ((c & (TA_PAGE - 1)) + bytes > TA_PAGE) {
+        ta->scene_bytes += TA_PAGE - (c & (TA_PAGE - 1));
+        c = (c | (TA_PAGE - 1)) + 1;
+        if (c >= end) {
+            c = first;
+        }
+    }
+    ta->scene_bytes += bytes;
+    if (ta->scene_bytes > end - first) {
+        ta_fault(s, "the scene outgrew the parameter memory (bytes)",
+                 end - first);
+        return 0;
+    }
+    at = c;
+    ta->cursor = c + bytes;
+    return at;
+}
+
+/* Entry `e` onto tile `t`'s list: a new block first, linked on when full. */
+static void ta_append(Intel2700GState *s, uint32_t t, uint32_t e)
+{
+    TAState *ta = &s->ta;
+
+    if (!ta->head[t]) {
+        uint32_t b = ta_alloc(s, TA_BLOCK_BYTES);
+
+        if (!b) {
+            return;
+        }
+        ta->head[t] = ta->tail[t] = ta->block[t] = b;
+    } else if (ta->tail[t] - ta->block[t] == TA_LINK_SLOT) {
+        uint32_t b = ta_alloc(s, TA_BLOCK_BYTES);
+
+        if (!b) {
+            return;
+        }
+        ta_store(s, ta->tail[t], (M3_LINK << 28) | (b & M3_ADDR_MASK));
+        ta->tail[t] = ta->block[t] = b;
+    }
+    ta_store(s, ta->tail[t], e);
+    ta->tail[t] += 4;
+    ta->entries++;
+}
+
+static double ta_float(uint32_t w)
+{
+    float f;
+
+    memcpy(&f, &w, sizeof(f));
+    return f;
+}
+
+/*
+ * The object class the state makes (0 the clear's colourless form, 1
+ * colour, 2 one texture, 3 two), or -1 refused.
+ */
+static int ta_class(Intel2700GState *s)
+{
+    TAState *ta = &s->ta;
+
+    if (ta->textured) {
+        return ta->tsp & TA_TSP_SECOND_UV ? 3 : 2;
+    }
+    if (ta->tsp & TA_TSP_COLOURLESS) {
+        if (ta->tsp == TA_CLEAR_TSP) {
+            return 0;
+        }
+        ta_fault(s, "an untextured TSP with bit 14 other than the clear's"
+                 " 0x22206F80 (its vertex form never measured)", ta->tsp);
+        return -1;
+    }
+    return 1;
+}
+
+/* The tile holding coordinate `v` (in tiles), held to lo..hi. */
+static int ta_tile(double v, int lo, int hi)
+{
+    v = floor(v);
+    return v < lo ? lo : v > hi ? hi : (int)v;
+}
+
+/* One object of `n` corners (3-6) from `v`, written and binned. */
+static void ta_object(Intel2700GState *s, const TAVert *const *v, int n,
+                      int cls)
+{
+    TAState *ta = &s->ta;
+    int units = cls > 1 ? cls - 1 : 0;
+    uint32_t words = cls == 0 ? 1 + 3 * n
+                              : 2 + 3 * units + 4 * n + n * (1 + 2 * units);
+    uint32_t at = ta_alloc(s, 4 * words), base = s->mbx[0x83C / 4];
+    uint32_t ptr, w = 0, cx0 = 0, cx1 = ta->cols - 1, cy0 = 0;
+    uint32_t cy1 = ta->rows - 1, x, y;
+    int tx0[4], tx1[4], ty0[4], ty1[4], i, k, u;
+    int bx0 = INT_MAX, bx1 = -1, by0 = INT_MAX, by1 = -1;
+
+    if (!at) {
+        return;
+    }
+#define PUT(val) ta_store(s, at + 4 * w++, (val))
+    if (cls == 0) {
+        PUT(ta->tsp);
+    } else {
+        PUT(ta->isp);
+        for (u = 0; u < units; u++) {
+            for (k = 0; k < 3; k++) {
+                PUT(ta->tex[u][k]);
+            }
+        }
+        PUT(ta->tsp);
+    }
+    for (k = 0; k < n; k++) {
+        PUT(v[k]->w[0]);
+        PUT(v[k]->w[1]);
+    }
+    for (k = 0; k < n; k++) {
+        PUT(v[k]->w[2]);
+    }
+    if (cls > 0) {
+        for (k = 0; k < n; k++) {
+            PUT(v[k]->w[3]);
+        }
+        for (k = 0; k < n; k++) {
+            PUT(v[k]->w[4]);
+            for (u = 0; u < 2 * units; u++) {
+                PUT(v[k]->w[5 + u]);
+            }
+        }
+    }
+#undef PUT
+    ptr = ((uint32_t)cls << 23) | ((uint32_t)(n - 3) << 21) |
+          (((at - base) / 4) & 0x001FFFFF);
+
+    /* The tiles: each triangle's box, the grid and the clip word's. */
+    if (ta->clip & TA_CLIP_ON) {
+        cx0 = ((ta->clip >> 21) & 127) * 2;
+        cx1 = MIN(cx1, ((ta->clip >> 14) & 127) * 2 + 1);
+        cy0 = (ta->clip >> 7) & 127;
+        cy1 = MIN(cy1, ta->clip & 127);
+    }
+    for (i = 0; i < n - 2; i++) {
+        double x0 = INFINITY, x1 = -INFINITY, y0 = INFINITY, y1 = -INFINITY;
+
+        tx0[i] = ty0[i] = 1;
+        tx1[i] = ty1[i] = 0;            /* empty unless set below */
+        for (k = i; k < i + 3; k++) {
+            double fx = ta_float(v[k]->w[0]), fy = ta_float(v[k]->w[1]);
+
+            if (!isfinite(fx) || !isfinite(fy)) {
+                x0 = NAN;
+                break;
+            }
+            x0 = MIN(x0, fx);
+            x1 = MAX(x1, fx);
+            y0 = MIN(y0, fy);
+            y1 = MAX(y1, fy);
+        }
+        if (isnan(x0) || x1 < 0 || y1 < 0 ||
+            x0 >= (double)(cx1 + 1) * M3_TILE_W ||
+            y0 >= (double)(cy1 + 1) * M3_TILE_H) {
+            continue;
+        }
+        tx0[i] = ta_tile(x0 / M3_TILE_W, cx0, cx1 + 1);
+        tx1[i] = ta_tile(x1 / M3_TILE_W, (int)cx0 - 1, cx1);
+        ty0[i] = ta_tile(y0 / M3_TILE_H, cy0, cy1 + 1);
+        ty1[i] = ta_tile(y1 / M3_TILE_H, (int)cy0 - 1, cy1);
+        if (tx0[i] > tx1[i] || ty0[i] > ty1[i]) {
+            tx0[i] = 1;
+            tx1[i] = 0;
+            continue;
+        }
+        bx0 = MIN(bx0, tx0[i]);
+        bx1 = MAX(bx1, tx1[i]);
+        by0 = MIN(by0, ty0[i]);
+        by1 = MAX(by1, ty1[i]);
+    }
+    for (y = MAX(by0, 0); (int)y <= by1; y++) {
+        for (x = MAX(bx0, 0); (int)x <= bx1; x++) {
+            uint32_t mask = 0;
+
+            for (i = 0; i < n - 2; i++) {
+                if ((int)x >= tx0[i] && (int)x <= tx1[i] &&
+                    (int)y >= ty0[i] && (int)y <= ty1[i]) {
+                    mask |= 1u << (30 - i);
+                }
+            }
+            if (mask) {
+                ta_append(s, y * ta->cols + x, mask | ptr);
+            }
+        }
+    }
+}
+
+/* The primitive's vertices as objects. */
+static void ta_primitive(Intel2700GState *s)
+{
+    TAState *ta = &s->ta;
+    const TAVert *v = (const TAVert *)ta->verts->data;
+    const TAVert *p[6];
+    int n = ta->verts->len, cls = ta_class(s), k, m, i;
+
+    if (cls < 0) {
+        return;
+    }
+    switch (ta->prim >> 28) {
+    case 0x4:                           /* a strip: objects of up to six */
+        for (k = 0; k + 2 < n && !ta->fault; k += m - 2) {
+            m = MIN(6, n - k);
+            for (i = 0; i < m; i++) {
+                p[i] = &v[k + i];
+            }
+            ta_object(s, p, m, cls);
+        }
+        break;
+    case 0x5:                           /* a fan */
+        for (k = 1; k + 1 < n && !ta->fault; k++) {
+            p[0] = &v[0];
+            p[1] = &v[k];
+            p[2] = &v[k + 1];
+            ta_object(s, p, 3, cls);
+        }
+        break;
+    default:                            /* 0x7, a triangle list */
+        if (n % 3) {
+            qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: TA: a triangle"
+                          " list of %d vertices: the last %d dropped\n",
+                          n, n % 3);
+        }
+        for (k = 0; k + 2 < n && !ta->fault; k += 3) {
+            for (i = 0; i < 3; i++) {
+                p[i] = &v[k + i];
+            }
+            ta_object(s, p, 3, cls);
+        }
+        break;
+    }
+}
+
+/* The field after `f` that the state block's mask holds (-1: none). */
+static int ta_next_field(TAState *ta, int f)
+{
+    for (; f < 10; f++) {
+        bool on = f == 0 ? ta->mask & 1 : f == 1 ? ta->mask & 2
+                : f <= 4 ? ta->mask & 4
+                : f <= 7 ? (ta->mask & 8) && (ta->tsp & TA_TSP_SECOND_UV)
+                : f == 8 ? ta->mask & 0x10 : ta->mask & 0x40;
+
+        if (on) {
+            return f;
+        }
+    }
+    return -1;
+}
+
+/* The scene's end: end words, the region array, done after its time. */
+static void ta_scene_end(Intel2700GState *s)
+{
+    TAState *ta = &s->ta;
+    uint32_t regions = s->mbx[0x844 / 4] & M3_ADDR_MASK, k;
+    uint32_t tiles = ta->cols * ta->rows;
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+    if (ta->prim || ta->mask) {
+        ta_fault(s, "the scene's end inside a primitive or state block",
+                 ta->prim | ta->mask);
+        return;
+    }
+    for (k = 0; k < tiles; k++) {
+        uint32_t h = (k % ta->cols) | (k / ta->cols) << 8 | TA_REGION_HEADER;
+        uint64_t a = regions + 8ull * k;
+
+        if (ta->head[k]) {
+            ta_store(s, ta->tail[k], M3_END << 28);
+        } else {
+            h |= M3_REGION_EMPTY;
+        }
+        if (k + 1 == tiles) {
+            h |= M3_LAST;
+        }
+        if (a + 8 <= INTEL_2700G_VRAM_SIZE) {
+            stl_le_p(vram + a, h);
+            stl_le_p(vram + a + 4, ta->head[k] & M3_ADDR_MASK);
+        }
+    }
+    memory_region_set_dirty(&s->vram, 0, INTEL_2700G_VRAM_SIZE);
+    ta->on = false;
+    ta->done_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (640 + ta->entries * 18 / 10000) * SCALE_US;
+}
+
+/* 0x800 = 1: a scene starts. */
+static void ta_start(Intel2700GState *s)
+{
+    TAState *ta = &s->ta;
+    uint32_t w = s->mbx[0x84C / 4] >> 16, h = s->mbx[0x850 / 4] >> 16;
+
+    ta->on = ta->fault = ta->aliased = false;
+    ta->mask = ta->prim = 0;
+    ta->vat = 0;
+    ta->entries = ta->scene_bytes = 0;
+    g_array_set_size(ta->verts, 0);
+    /* Nothing without the clock and the manager, or with the core hung. */
+    if (!m3_clock_on(s) || !s->m3_pm_set || s->m3_hung) {
+        qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: TA started without"
+                      " the 3D clock or the memory manager, or hung:"
+                      " ignored\n");
+        return;
+    }
+    ta->cols = DIV_ROUND_UP(w, M3_TILE_W);
+    ta->rows = DIV_ROUND_UP(h, M3_TILE_H);
+    if (!ta->cols || !ta->rows || ta->cols > 128 || ta->rows > 128) {
+        qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: TA: a %u x %u target"
+                      " (0x84C, 0x850) has no grid of 1-128 tiles a side\n",
+                      w, h);
+        return;
+    }
+    memset(ta->head, 0, sizeof(uint32_t) * TA_TILES);
+    ta->on = true;
+}
+
+/* A word into the TA's window. */
+static void ta_word(Intel2700GState *s, uint32_t w)
+{
+    TAState *ta = &s->ta;
+
+    if (!ta->on) {
+        qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: TA window written"
+                      " (0x%08x) with no scene started\n", w);
+        return;
+    }
+    if (ta->fault) {
+        return;
+    }
+    if (ta->mask) {
+        switch (ta->field) {
+        case 0:
+            ta->tsp = w;
+            break;
+        case 1:
+            ta->isp = w;
+            break;
+        case 2: case 3: case 4:
+            ta->tex[0][ta->field - 2] = w;
+            break;
+        case 5: case 6: case 7:
+            ta->tex[1][ta->field - 5] = w;
+            break;
+        case 8:
+            ta->clip = w;
+            break;
+        default:
+            ta->word6 = w;
+            break;
+        }
+        ta->field = ta_next_field(ta, ta->field + 1);
+        if (ta->field < 0) {
+            ta->mask = 0;
+        }
+        return;
+    }
+    if (ta->prim) {
+        ta->cur.w[ta->vat++] = w;
+        if (ta->vat == ta->vwords) {
+            if (ta->verts->len >= TA_MAX_VERTS) {
+                ta_fault(s, "a primitive of over a million vertices",
+                         ta->prim);
+                return;
+            }
+            g_array_append_val(ta->verts, ta->cur);
+            ta->vat = 0;
+        }
+        return;
+    }
+    switch (w >> 28) {
+    case 0xF:
+        if (w != TA_END_WORD) {
+            ta_fault(s, "an end word never measured", w);
+        } else if (!(s->mbx[0x85C / 4] & TA_SCENE_END)) {
+            ta_fault(s, "the end word with 0x85C bit 7 clear (a context's"
+                     " pause, its state saved: not modelled)", w);
+        } else {
+            ta_scene_end(s);
+        }
+        break;
+    case 0x1:
+        if (w & 0x0FFFFFFF & ~TA_MASK_KNOWN) {
+            ta_fault(s, "state block mask bits never measured", w);
+            break;
+        }
+        ta->mask = w | (1u << 31);      /* non-zero while being read */
+        if (w & 1) {
+            ta->textured = w & 4;
+        }
+        ta->field = ta_next_field(ta, 0);
+        if (ta->field < 0) {
+            ta->mask = 0;
+        }
+        break;
+    case 0x4: case 0x5: case 0x7: {
+        int cls;
+
+        if (w & 0x0FFFFFFF) {
+            ta_fault(s, "a primitive word with its low bits set (a polygon"
+                     " offset, never measured)", w);
+            break;
+        }
+        ta->prim = w;
+        cls = ta_class(s);
+        if (cls < 0) {
+            break;
+        }
+        ta->vwords = cls == 0 ? 3 : 3 + 2 * cls;
+        ta->vat = 0;
+        g_array_set_size(ta->verts, 0);
+        break;
+    }
+    default:
+        ta_fault(s, "a word where a state block, primitive or the end"
+                 " belongs, never measured", w);
+        break;
+    }
+}
+
+/* A write to the end window: the primitive ends. */
+static void ta_end(Intel2700GState *s)
+{
+    TAState *ta = &s->ta;
+
+    if (!ta->on || ta->fault) {
+        return;
+    }
+    if (ta->mask || ta->vat) {
+        ta_fault(s, "a primitive's end inside a state block or a vertex",
+                 ta->mask ? ta->mask : ta->prim);
+        return;
+    }
+    if (!ta->prim) {
+        qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: TA: an end with no"
+                      " primitive\n");
+        return;
+    }
+    ta_primitive(s);
+    ta->prim = 0;
 }
 
 /* A write to the MBX block that concerns the 3D core. */
@@ -1767,12 +2449,21 @@ static void m3_write(Intel2700GState *s, hwaddr off, uint32_t val)
 
     if (off == MBX_RESET && val == 0x111) {
         s->m3_done_ns = s->m3_ready_ns = M3_NONE;
-        s->m3_pm_set = s->m3_hung = false;
+        s->m3_pm_set = false;
+        /* A two-unit hang outlasts a reset unless the 3D clock went off. */
+        if (!s->m3_hang_needs_clock || s->m3_clock_cycled) {
+            s->m3_hung = s->m3_hang_needs_clock = false;
+        }
+        s->ta.on = false;
+        s->ta.done_ns = M3_NONE;
         s->mbx[MBX_STATUS / 4] &= ~(M3_RENDER_DONE | M3_RENDER_DONE_B3 |
-                                    M3_PM_READY);
+                                    M3_PM_READY | TA_DONE);
     } else if (off == M3_PM_GO && val == 1 && m3_clock_on(s)) {
         s->m3_pm_set = true;
         s->m3_ready_ns = now + 164 * SCALE_US;
+        s->ta.cursor = s->mbx[0x828 / 4] << 12;
+    } else if (off == TA_START && val == 1) {
+        ta_start(s);
     } else if (off == M3_START && val == 1) {
         /* Nothing without the clock and the manager (version 1), or hung. */
         if (!m3_clock_on(s) || !s->m3_pm_set || s->m3_hung) {
@@ -1781,6 +2472,7 @@ static void m3_write(Intel2700GState *s, hwaddr off, uint32_t val)
         us = m3_render(s);
         if (us < 0) {
             s->m3_hung = true;
+            s->m3_clock_cycled = false;
             return;
         }
         s->m3_done_ns = now + us * SCALE_US;
@@ -1833,6 +2525,12 @@ static MemTxResult i2700g_read(void *opaque, hwaddr addr, uint64_t *data,
     if (addr >= MBX_2D_PORT && addr < MBX_2D_PORT + MBX_2D_SIZE) {
         qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: read of the 2D command"
                       " window (write-only)\n");
+        return MEMTX_ERROR;
+    }
+    if ((addr >= TA_PORT && addr < TA_PORT + TA_PORT_SIZE) ||
+        (addr >= TA_END_PORT && addr < TA_END_PORT + TA_PORT_SIZE)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "intel-2700g: read of the TA's"
+                      " windows (write-only)\n");
         return MEMTX_ERROR;
     }
     if (system_block_freezes(addr)) {
@@ -1891,6 +2589,17 @@ static MemTxResult i2700g_write(void *opaque, hwaddr addr, uint64_t val,
     if (addr >= MBX_2D_PORT && addr < MBX_2D_PORT + MBX_2D_SIZE) {
         mbx_command(s, val);            /* any offset: the window is a FIFO */
         return MEMTX_OK;
+    }
+    if (addr >= TA_PORT && addr < TA_PORT + TA_PORT_SIZE) {
+        ta_word(s, val);                /* any offset: the window is a FIFO */
+        return MEMTX_OK;
+    }
+    if (addr >= TA_END_PORT && addr < TA_END_PORT + TA_PORT_SIZE) {
+        ta_end(s);
+        return MEMTX_OK;
+    }
+    if (addr == R_MBXCLK && (val & 3) != 2 && s->m3_hung) {
+        s->m3_clock_cycled = true;      /* the 3D clock off: C53's cure */
     }
     if (addr >= sizeof(s->regs)) {
         qemu_log_mask(LOG_UNIMP, "intel-2700g: write 0x%08" PRIx64 " to 0x%05"
@@ -2293,6 +3002,13 @@ static void i2700g_reset(DeviceState *dev)
     s->mbx_blend = 0;
     s->m3_done_ns = s->m3_ready_ns = M3_NONE;
     s->m3_pm_set = s->m3_hung = false;
+    s->m3_hang_needs_clock = s->m3_clock_cycled = false;
+    s->ta.on = s->ta.fault = false;
+    s->ta.done_ns = M3_NONE;
+    s->ta.cursor = 0;
+    s->ta.mask = s->ta.prim = 0;
+    s->ta.tsp = s->ta.isp = s->ta.clip = s->ta.word6 = 0;
+    s->ta.textured = false;
     s->ev_epoch = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->ev_base = 0;
     s->line_ns = LINE_NS;
@@ -2321,14 +3037,18 @@ static void i2700g_realize(DeviceState *dev, Error **errp)
     qdev_init_gpio_out_named(dev, &s->irq, "irq", 1);
     s->ev_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, i2700g_ev_tick, s);
     s->m3_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, m3_timer_cb, s);
+    s->ta.verts = g_array_new(FALSE, FALSE, sizeof(TAVert));
+    s->ta.head = g_new0(uint32_t, TA_TILES);
+    s->ta.tail = g_new0(uint32_t, TA_TILES);
+    s->ta.block = g_new0(uint32_t, TA_TILES);
     object_property_add_bool(OBJECT(dev), "backlight", i2700g_get_backlight,
                              NULL);
 }
 
 static const VMStateDescription vmstate_i2700g = {
     .name = "intel-2700g",
-    .version_id = 6,
-    .minimum_version_id = 6,
+    .version_id = 7,
+    .minimum_version_id = 7,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Intel2700GState, NREGS),
         VMSTATE_BOOL(dark, Intel2700GState),
@@ -2364,6 +3084,11 @@ static const VMStateDescription vmstate_i2700g = {
         VMSTATE_BOOL(m3_pm_set, Intel2700GState),
         VMSTATE_BOOL(m3_hung, Intel2700GState),
         VMSTATE_TIMER_PTR(m3_timer, Intel2700GState),
+        VMSTATE_BOOL(m3_hang_needs_clock, Intel2700GState),
+        VMSTATE_BOOL(m3_clock_cycled, Intel2700GState),
+        /* A TA scene mid-stream isn't kept: only its done and pointer. */
+        VMSTATE_INT64(ta.done_ns, Intel2700GState),
+        VMSTATE_UINT32(ta.cursor, Intel2700GState),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -2378,7 +3103,9 @@ static const VMStateDescription vmstate_i2700g = {
  * ROP3, ROP4 through a 1 bpp mask, rotation bits 25-26 (retropane-os
  * rp-mbx-blend B10 and B11 on the X51v, 2026-10-22); mbx-2d-pal (branch
  * rp-next): 1 and 8 bpp sources through the source palette, the scale word
- * (nearest pixel), header bit 21 writing nothing (B7, B9, B10).
+ * (nearest pixel), header bit 21 writing nothing (B7, B9, B10); mbx-ta
+ * (from rp-v0.32.0): the tile accelerator, its scenes binned into the
+ * objects, lists and region array the X51v's TA writes (retropane-os R288).
  */
 static bool i2700g_get_mbx_2d(Object *obj, Error **errp)
 {
@@ -2412,6 +3139,7 @@ static void i2700g_class_init(ObjectClass *klass, void *data)
                                    NULL);
     object_class_property_add_bool(klass, "mbx-2d-pal", i2700g_get_mbx_2d,
                                    NULL);
+    object_class_property_add_bool(klass, "mbx-ta", i2700g_get_mbx_2d, NULL);
     device_class_set_props(dc, i2700g_properties);
 }
 
