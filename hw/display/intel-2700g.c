@@ -1157,7 +1157,8 @@ static void i2700g_ev_tick(void *opaque)
  * hangs the core (rp-glesfeat M), a hang a reset alone keeps until the 3D
  * clock goes off (rp-glesfeat M2, audit C53). Flat shading
  * takes the first vertex's colour, TSP bit 22 Gouraud; textures are
- * twiddled, point sampled, TEX0 bits 15-13 the format, 27-24/23-20 the
+ * twiddled, point sampled at u, v corrected by the corners' 1/w (rp-glesfeat
+ * test P; Gouraud colours stay screen-linear: not measured), TEX0 bits 15-13 the format, 27-24/23-20 the
  * sides, 31-28 the address modes (wrap, mirror, clamp); TSP bit 13 blends
  * with the factors in bits 31-26 (each term value x factor >> 8, alpha
  * factors a and 256 - a); TSP bits 11-9 compare depth in GL order (all
@@ -1217,6 +1218,7 @@ static void i2700g_ev_tick(void *opaque)
 
 typedef struct M3Vertex {
     double x, y, z, u, v;
+    double rhw;                     /* 1/w: u, v are corrected by it */
     uint32_t argb;
 } M3Vertex;
 
@@ -1285,6 +1287,7 @@ static void m3_strip(Intel2700GState *s, uint32_t at, bool textured, int n,
         v->x = m3_float(m3_word(s, at + 4 * (h + 2 * k)));
         v->y = m3_float(m3_word(s, at + 4 * (h + 1 + 2 * k)));
         v->z = m3_float(m3_word(s, at + 4 * (h + 2 * n + k)));
+        v->rhw = m3_float(m3_word(s, at + 4 * (h + 3 * n + k)));
         if (textured) {
             v->argb = m3_word(s, at + 4 * (h + 4 * n + 3 * k));
             v->u = m3_float(m3_word(s, at + 4 * (h + 4 * n + 3 * k + 1)));
@@ -1545,6 +1548,36 @@ static double m3_edge(const M3Vertex *a, const M3Vertex *b, double x,
 }
 
 /* The texture coordinates of object `o` at (x, y). */
+/*
+ * u, v at screen weights w[]: corrected by each corner's 1/w, as the X51v
+ * draws (retropane-os rp-glesfeat test P run 1, R289, 2026-11-16: 31 of 31
+ * and 34 of 36 probes the perspective-correct texel, none the affine one):
+ * u = sum(w u rhw) / sum(w rhw). With the three 1/w equal (every object
+ * before R289 sent 1.0) that is the affine sum, taken as such so those
+ * pictures stay bit for bit; a 1/w that isn't a positive finite number
+ * falls back to it too (never measured).
+ */
+static void m3_tex_uv(const M3Vertex *v, const double w[3], double *u,
+                      double *vv)
+{
+    double r = w[0] * v[0].rhw + w[1] * v[1].rhw + w[2] * v[2].rhw;
+    bool flat = v[0].rhw == v[1].rhw && v[1].rhw == v[2].rhw;
+    int i;
+
+    for (i = 0; i < 3 && !flat; i++) {
+        flat = !isfinite(v[i].rhw) || v[i].rhw <= 0;
+    }
+    if (flat || r == 0) {
+        *u = w[0] * v[0].u + w[1] * v[1].u + w[2] * v[2].u;
+        *vv = w[0] * v[0].v + w[1] * v[1].v + w[2] * v[2].v;
+        return;
+    }
+    *u = (w[0] * v[0].u * v[0].rhw + w[1] * v[1].u * v[1].rhw +
+          w[2] * v[2].u * v[2].rhw) / r;
+    *vv = (w[0] * v[0].v * v[0].rhw + w[1] * v[1].v * v[1].rhw +
+           w[2] * v[2].v * v[2].rhw) / r;
+}
+
 static void m3_uv(const M3Obj *o, double x, double y, double area,
                   double *u, double *v)
 {
@@ -1554,8 +1587,7 @@ static void m3_uv(const M3Obj *o, double x, double y, double area,
     for (i = 0; i < 3; i++) {
         w[i] = m3_edge(&o->v[(i + 1) % 3], &o->v[(i + 2) % 3], x, y) / area;
     }
-    *u = w[0] * o->v[0].u + w[1] * o->v[1].u + w[2] * o->v[2].u;
-    *v = w[0] * o->v[0].v + w[1] * o->v[1].v + w[2] * o->v[2].v;
+    m3_tex_uv(o->v, w, u, v);
 }
 
 /*
@@ -1674,8 +1706,7 @@ static void m3_draw(Intel2700GState *s, const M3Obj *o, M3Tile *t)
                                         x - 0.5, y - 0.5) / area;
                     }
                 }
-                u = wt[0] * v[0].u + wt[1] * v[1].u + wt[2] * v[2].u;
-                vv = wt[0] * v[0].v + wt[1] * v[1].v + wt[2] * v[2].v;
+                m3_tex_uv(v, wt, &u, &vv);
 
                 /*
                  * TEX2 bit 13 (Dell's opaque combine word) makes the
@@ -1937,10 +1968,10 @@ static bool m3_clock_on(Intel2700GState *s)
  * wrapping at its last page (Dell's scenes lay mid-memory); end words
  * written at the scene end; the tail buffer (0x840) not written (its form
  * is unknown); the TA's FIFO level (510 on the device while it bins) not
- * shown. u and v go into the objects as fed, affine, and 1/w is copied:
- * how the TA treats perspective (u, v divided by w or not, z and 1/w's
- * range) is R289's question, never measured; until then this model and
- * the 3D core draw u, v affinely.
+ * shown. u, v and 1/w go into the objects as fed, as Dell's driver feeds
+ * them (u, v plain, 1/w a float per vertex, z GL's window depth: R289's
+ * reading of DoomGLES's objects), and the 3D core corrects u, v by 1/w as
+ * the X51v does (rp-glesfeat test P).
  *
  * Refused loudly (logged, the scene never says done, as a device that
  * hung would look): unknown mask bits, a primitive word with its low bits
@@ -3105,7 +3136,9 @@ static const VMStateDescription vmstate_i2700g = {
  * rp-next): 1 and 8 bpp sources through the source palette, the scale word
  * (nearest pixel), header bit 21 writing nothing (B7, B9, B10); mbx-ta
  * (from rp-v0.32.0): the tile accelerator, its scenes binned into the
- * objects, lists and region array the X51v's TA writes (retropane-os R288).
+ * objects, lists and region array the X51v's TA writes (retropane-os R288);
+ * mbx-3d-persp (from rp-v0.33.0): texture coordinates corrected by each
+ * corner's 1/w (R289, rp-glesfeat test P).
  */
 static bool i2700g_get_mbx_2d(Object *obj, Error **errp)
 {
@@ -3140,6 +3173,8 @@ static void i2700g_class_init(ObjectClass *klass, void *data)
     object_class_property_add_bool(klass, "mbx-2d-pal", i2700g_get_mbx_2d,
                                    NULL);
     object_class_property_add_bool(klass, "mbx-ta", i2700g_get_mbx_2d, NULL);
+    object_class_property_add_bool(klass, "mbx-3d-persp", i2700g_get_mbx_2d,
+                                   NULL);
     device_class_set_props(dc, i2700g_properties);
 }
 
