@@ -167,6 +167,32 @@ static unsigned encode_gpcsc(ARMMMUFaultInfo *fi)
     return gpcsc[fi->gpcf] | fi->level;
 }
 
+/*
+ * RetroPane (retropane-os R368): a data abort's fault address after the
+ * Fast Context Switch Extension, as the X51v's XScale reports it. The
+ * ARMv5 FAR holds the modified virtual address, so a process in slot 5
+ * (FCSE PID 0x0a000000) touching 0x00103000 faults at 0x0a103000
+ * (retropane-os rp-kernel G5 run 3, 2026-11-23); upstream reports the
+ * address before relocation. The condition is get_phys_addr_nogpc's own,
+ * so the FAR names the address the walk translated. A prefetch abort
+ * keeps the PC as the process saw it (v5 has no IFAR; the X51v's LR
+ * holds the unrelocated PC).
+ */
+static vaddr fcse_fault_address(CPUARMState *env, vaddr addr, int mmu_idx)
+{
+    ARMMMUIdx idx = core_to_arm_mmu_idx(env, mmu_idx);
+
+    if (addr < 0x02000000 && idx != ARMMMUIdx_Stage2
+        && !arm_feature(env, ARM_FEATURE_V8)) {
+        if (regime_el(env, idx) == 3) {
+            addr += env->cp15.fcseidr_s;
+        } else {
+            addr += env->cp15.fcseidr_ns;
+        }
+    }
+    return addr;
+}
+
 static G_NORETURN
 void arm_deliver_fault(ARMCPU *cpu, vaddr addr,
                        MMUAccessType access_type,
@@ -257,6 +283,9 @@ void arm_deliver_fault(ARMCPU *cpu, vaddr addr,
     }
 
  do_raise:
+    if (access_type != MMU_INST_FETCH) {
+        addr = fcse_fault_address(env, addr, mmu_idx);
+    }
     env->exception.vaddress = addr;
     env->exception.fsr = fsr;
     raise_exception(env, exc, syn, target_el);
