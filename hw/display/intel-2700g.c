@@ -1730,6 +1730,110 @@ static void m3_draw(Intel2700GState *s, const M3Obj *o, M3Tile *t)
     }
 }
 
+/*
+ * The 3D core's dither (0x650 bit 3, retropane-os rp-gpubench run P2 on the
+ * X51v): a 4 x 4 ordered matrix from the target's first pixel, in sixteenths
+ * of a step; 16 never rounds up (drivers/mbx3d-render's DITHER).
+ */
+static const uint32_t m3_dither[16] = {
+    11, 3, 9, 1, 7, 15, 5, 13, 10, 2, 12, 4, 6, 14, 8, 16,
+};
+
+/*
+ * An 8-bit channel to `bits`: truncated, or one step up where the dropped
+ * fraction reaches threshold `t` (sixteenths of a step; < 0: no dither),
+ * never past the top (run P2: the 5- and 6-bit channels share the matrix).
+ */
+static uint32_t m3_channel(uint32_t v, int bits, int t)
+{
+    int lost = 8 - bits;
+    uint32_t q = (v & 0xFF) >> lost, frac = v & ((1u << lost) - 1);
+
+    if (t >= 0 && frac * 16 >= (uint32_t)t << lost && q < (1u << bits) - 1) {
+        return q + 1;
+    }
+    return q;
+}
+
+/* Writes tile `t` into the target as 0x650 and 0x644 say (see m3_render). */
+static void m3_write_tile(Intel2700GState *s, uint8_t *vram, const M3Tile *t,
+                          uint32_t target, uint32_t stride)
+{
+    uint32_t r650 = s->mbx[0x650 / 4], r644 = s->mbx[0x644 / 4];
+    uint32_t format = r650 & 7, bx = (r644 >> 1) & 1, by = r644 & 1;
+    bool dither = r650 & 8;
+    uint32_t px, py, i, j, k;
+
+    for (py = 0; py < (M3_TILE_H >> by); py++) {
+        for (px = 0; px < (M3_TILE_W >> bx); px++) {
+            uint32_t sum[4] = { 0, 0, 0, 0 }, c = 0, x, y, r, g, b, v;
+            uint64_t row, a;
+            int th;
+
+            for (j = 0; j < (1u << by); j++) {
+                for (i = 0; i < (1u << bx); i++) {
+                    uint32_t p = t->c[((py << by) + j) * M3_TILE_W +
+                                      (px << bx) + i];
+
+                    for (k = 0; k < 4; k++) {
+                        sum[k] += (p >> (8 * k)) & 0xFF;
+                    }
+                }
+            }
+            for (k = 0; k < 4; k++) {
+                c |= (sum[k] >> (bx + by)) << (8 * k);
+            }
+            x = ((uint32_t)t->x >> bx) + px;
+            y = ((uint32_t)t->y >> by) + py;
+            row = target + (uint64_t)y * stride;
+            th = dither ? (int)m3_dither[(y % 4) * 4 + x % 4] : -1;
+            r = (c >> 16) & 0xFF;
+            g = (c >> 8) & 0xFF;
+            b = c & 0xFF;
+            switch (format) {
+            case 0: case 1: case 2: case 3: case 7:
+                switch (format) {
+                case 0:
+                    v = m3_channel(r, 5, th) << 10 | m3_channel(g, 5, th) << 5 |
+                        m3_channel(b, 5, th);
+                    break;
+                case 1:
+                    v = m3_channel(r, 5, th) << 11 | m3_channel(g, 6, th) << 5 |
+                        m3_channel(b, 5, th);
+                    break;
+                case 3:
+                    v = 1u << 15 | m3_channel(r, 5, th) << 10 |
+                        m3_channel(g, 5, th) << 5 | m3_channel(b, 5, th);
+                    break;
+                default:                /* 2 and 7: ARGB4444 */
+                    v = (c >> 28) << 12 | m3_channel(r, 4, th) << 8 |
+                        m3_channel(g, 4, th) << 4 | m3_channel(b, 4, th);
+                    break;
+                }
+                a = row + 2 * (uint64_t)x;
+                if (a + 2 <= INTEL_2700G_VRAM_SIZE) {
+                    stw_le_p(vram + a, v);
+                }
+                break;
+            case 4:                     /* packed 24-bit, blue first */
+                a = row + 3 * (uint64_t)x;
+                if (a + 3 <= INTEL_2700G_VRAM_SIZE) {
+                    vram[a] = b;
+                    vram[a + 1] = g;
+                    vram[a + 2] = r;
+                }
+                break;
+            default:                    /* 5 xRGB8888, 6 ARGB8888 */
+                a = row + 4 * (uint64_t)x;
+                if (a + 4 <= INTEL_2700G_VRAM_SIZE) {
+                    stl_le_p(vram + a, format == 5 ? c & 0x00FFFFFF : c);
+                }
+                break;
+            }
+        }
+    }
+}
+
 /* What a quad adds to a tile, quarter-microseconds (rp-mbx3d-api run 2). */
 static uint32_t m3_quad_cost(const M3Obj *o)
 {
@@ -1753,7 +1857,6 @@ static int64_t m3_render(Intel2700GState *s)
         uint32_t w0 = m3_word(s, regions + 8 * k);
         uint32_t list = m3_word(s, regions + 8 * k + 4) & M3_ADDR_MASK;
         uint32_t objects = 0;
-        int px, py;
 
         if (w0 & M3_REGION_EMPTY) {
             /* The TA's empty tile: not rendered, its pixels untouched. */
@@ -1826,38 +1929,21 @@ static int64_t m3_render(Intel2700GState *s)
             objects++;
         }
         /*
-         * The target's format (0x650, rp-mbx3d version 26): 6 ARGB8888,
-         * 1 RGB565, 3 ARGB1555 (channels truncated, the alpha bit from
-         * bit 7: assumed); tiles stay 8 x 16.
+         * The tile's write-out (retropane-os rp-mbx3d version 26, rp-gpubench
+         * runs P, P2 and T on the X51v; drivers/mbx3d-render/src/model.rs
+         * is the same): 0x650 bits 2-0 the layout, 0 RGB555 with the top
+         * bit 0, 1 RGB565, 2 and 7 ARGB4444, 3 ARGB1555 with the top bit 1
+         * whatever the alpha, 4 packed 24-bit (blue first), 5 xRGB8888
+         * with the top byte 0, 6 ARGB8888; channels truncated, or with
+         * bit 3 on a 16-bit layout dithered by run P2's 4 x 4 matrix from
+         * the target's first pixel (alpha not dithered). 0x644 bit 0 /
+         * bit 1 (run T) halve the rows / the columns, each pixel the
+         * average of the two (both: four) rendered ones, an odd sum
+         * truncated (assumed). Tiles stay 8 x 16. (Before rp-v0.35.0 only
+         * 1, 3 and 6 were written; 9, ADR-0023's dithered screens, went
+         * out as 32-bit pixels: retropane-os R414, emu-apps kit11.)
          */
-        for (py = 0; py < M3_TILE_H; py++) {
-            for (px = 0; px < M3_TILE_W; px++) {
-                uint32_t c = t->c[py * M3_TILE_W + px], fmt = s->mbx[0x650 / 4];
-                uint32_t r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
-                uint64_t row = target + (uint64_t)(t->y + py) * stride;
-
-                if (fmt == 1 || fmt == 3) {
-                    uint64_t a = row + 2 * (t->x + px);
-                    uint32_t v = fmt == 1
-                        ? (r >> 3) << 11 | (g >> 2) << 5 | b >> 3
-                        : (c >> 31) << 15 | (r >> 3) << 10 | (g >> 3) << 5 | b >> 3;
-
-                    if (a + 2 <= INTEL_2700G_VRAM_SIZE) {
-                        stw_le_p(vram + a, v);
-                    }
-                } else {
-                    uint64_t a = row + 4 * (t->x + px);
-
-                    if (fmt != 6) {
-                        qemu_log_mask(LOG_UNIMP, "intel-2700g: 3D target"
-                                      " format %u never measured\n", fmt);
-                    }
-                    if (a + 4 <= INTEL_2700G_VRAM_SIZE) {
-                        stl_le_p(vram + a, c);
-                    }
-                }
-            }
-        }
+        m3_write_tile(s, vram, t, target, stride);
         tiles++;
         if (w0 & M3_LAST) {
             break;
@@ -3138,7 +3224,9 @@ static const VMStateDescription vmstate_i2700g = {
  * (from rp-v0.32.0): the tile accelerator, its scenes binned into the
  * objects, lists and region array the X51v's TA writes (retropane-os R288);
  * mbx-3d-persp (from rp-v0.33.0): texture coordinates corrected by each
- * corner's 1/w (R289, rp-glesfeat test P).
+ * corner's 1/w (R289, rp-glesfeat test P); mbx-3d-writeout (from rp-v0.35.0):
+ * every 0x650 target layout, its bit 3 dither and 0x644's halving (runs P,
+ * P2 and T; R414).
  */
 static bool i2700g_get_mbx_2d(Object *obj, Error **errp)
 {
@@ -3175,6 +3263,8 @@ static void i2700g_class_init(ObjectClass *klass, void *data)
     object_class_property_add_bool(klass, "mbx-ta", i2700g_get_mbx_2d, NULL);
     object_class_property_add_bool(klass, "mbx-3d-persp", i2700g_get_mbx_2d,
                                    NULL);
+    object_class_property_add_bool(klass, "mbx-3d-writeout",
+                                   i2700g_get_mbx_2d, NULL);
     device_class_set_props(dc, i2700g_properties);
 }
 
